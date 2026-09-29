@@ -11,34 +11,67 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 @router.get("/stats")
 async def get_dashboard_stats(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
-    # 1. 資產統計
+    # 1. 總資產統計 (依據不重複 Asset 計算)
     total_assets = await db.scalar(select(func.count(Asset.id)).where(Asset.status != "deleted")) or 0
     photo_count = await db.scalar(select(func.count(Asset.id)).where(Asset.media_type == MediaType.PHOTO, Asset.status != "deleted")) or 0
     raw_count = await db.scalar(select(func.count(Asset.id)).where(Asset.media_type == MediaType.RAW, Asset.status != "deleted")) or 0
     video_count = await db.scalar(select(func.count(Asset.id)).where(Asset.media_type == MediaType.VIDEO, Asset.status != "deleted")) or 0
     total_size = await db.scalar(select(func.sum(Asset.size_total)).where(Asset.status != "deleted")) or 0
 
-    # 2. 候選統計 (包含 AI 語義分類與傳統規則)
-    candidates_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.state == CandidateState.CANDIDATE)) or 0
-    screenshot_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "screenshot", Candidate.state == CandidateState.CANDIDATE)) or 0
-    document_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "document", Candidate.state == CandidateState.CANDIDATE)) or 0
-    meme_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "meme", Candidate.state == CandidateState.CANDIDATE)) or 0
-    mistouch_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "mistouch", Candidate.state == CandidateState.CANDIDATE)) or 0
+    # 2. 候選清理項目統計 (依據不重複且建議刪除的 Asset 計算，排除建議保留的 Keeper)
+    candidates_count_query = (
+        select(func.count(func.distinct(Candidate.asset_id)))
+        .join(Asset, Candidate.asset_id == Asset.id)
+        .where(
+            Candidate.is_keeper == False,
+            Candidate.state == CandidateState.CANDIDATE,
+            Asset.status != "deleted"
+        )
+    )
+    candidates_count = await db.scalar(candidates_count_query) or 0
 
-    exact_dup_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "exact_dup", Candidate.state == CandidateState.CANDIDATE)) or 0
-    near_dup_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "near_dup", Candidate.state == CandidateState.CANDIDATE)) or 0
-    blur_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "blur", Candidate.state == CandidateState.CANDIDATE)) or 0
-    exposure_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule.in_(["over_exposure", "under_exposure"]), Candidate.state == CandidateState.CANDIDATE)) or 0
+    # 各分類候選相片張數 (不重複資產)
+    async def get_rule_distinct_count(rule_name_or_list):
+        if isinstance(rule_name_or_list, list):
+            condition = Candidate.rule.in_(rule_name_or_list)
+        else:
+            condition = (Candidate.rule == rule_name_or_list)
+            
+        q = (
+            select(func.count(func.distinct(Candidate.asset_id)))
+            .join(Asset, Candidate.asset_id == Asset.id)
+            .where(
+                condition,
+                Candidate.is_keeper == False,
+                Candidate.state == CandidateState.CANDIDATE,
+                Asset.status != "deleted"
+            )
+        )
+        return await db.scalar(q) or 0
 
-    # 可釋放容量
+    screenshot_count = await get_rule_distinct_count("screenshot")
+    document_count = await get_rule_distinct_count("document")
+    meme_count = await get_rule_distinct_count("meme")
+    mistouch_count = await get_rule_distinct_count("mistouch")
+
+    exact_dup_count = await get_rule_distinct_count("exact_dup")
+    near_dup_count = await get_rule_distinct_count("near_dup")
+    blur_count = await get_rule_distinct_count("blur")
+    exposure_count = await get_rule_distinct_count(["over_exposure", "under_exposure"])
+
+    # 3. 預計可釋放容量 (只計算非 Keeper 且處於 candidate 或 queued 的資產總容量)
     releasable_size_query = (
-        select(func.sum(Asset.size_total))
+        select(func.sum(func.distinct(Asset.size_total)))
         .join(Candidate, Candidate.asset_id == Asset.id)
-        .where(Candidate.is_keeper == False, Candidate.state.in_([CandidateState.CANDIDATE, CandidateState.QUEUED]), Asset.status != "deleted")
+        .where(
+            Candidate.is_keeper == False,
+            Candidate.state.in_([CandidateState.CANDIDATE, CandidateState.QUEUED]),
+            Asset.status != "deleted"
+        )
     )
     releasable_size = await db.scalar(releasable_size_query) or 0
 
-    # 3. 歷史累計已刪除容量
+    # 4. 歷史累計已刪除容量
     deleted_size_query = (
         select(func.sum(Asset.size_total))
         .join(ActionLog, ActionLog.asset_id == Asset.id)
