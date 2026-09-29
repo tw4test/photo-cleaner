@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 from datetime import datetime
@@ -35,18 +35,56 @@ async def list_roots(db: AsyncSession = Depends(get_db)):
 
 @router.post("", response_model=RootResponse)
 async def create_root(payload: RootCreate, db: AsyncSession = Depends(get_db)):
-    # Validate path exists
-    target_path = Path(payload.path).resolve()
+    raw_path = payload.path.strip()
+    if not raw_path:
+        raise HTTPException(status_code=400, detail="請輸入有效的目錄路徑")
+
+    # Validate path exists and is a directory
+    try:
+        target_path = Path(raw_path).resolve()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"路徑格式不合法：{str(e)}")
+
     if not target_path.exists() or not target_path.is_dir():
         raise HTTPException(status_code=400, detail=f"目錄路徑不存在或非資料夾：{payload.path}")
 
-    # Check duplicate
-    existing = await db.execute(select(Root).where(Root.path == str(target_path)))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="此路徑已加入過掃描清單")
+    target_str = str(target_path)
+
+    # 取得現有所有掃描路徑進行比對
+    all_roots_res = await db.execute(select(Root))
+    all_roots = all_roots_res.scalars().all()
+
+    for r in all_roots:
+        existing_path = Path(r.path).resolve()
+
+        # 1. 檢查完全重複 (不分大小寫與格式化)
+        if existing_path == target_path or str(existing_path).lower() == target_str.lower():
+            raise HTTPException(status_code=400, detail=f"此目錄「{r.path}」已在掃描清單中，無法重複加入。")
+
+        # 2. 檢查是否已被現有的上層遞迴目錄涵蓋
+        if r.recursive:
+            try:
+                target_path.relative_to(existing_path)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"此目錄已被已登錄的上層目錄「{r.path}」（已開啟遞迴掃描）涵蓋，無需重複加入。"
+                )
+            except ValueError:
+                pass
+
+        # 3. 檢查新目錄是否涵蓋了現有的子目錄
+        if payload.recursive:
+            try:
+                existing_path.relative_to(target_path)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"欲新增的目錄涵蓋了已登錄的子目錄「{r.path}」。請先移除該子目錄後再加入上層目錄，以避免重複掃描。"
+                )
+            except ValueError:
+                pass
 
     root = Root(
-        path=str(target_path),
+        path=target_str,
         recursive=payload.recursive,
         exclude_patterns=payload.exclude_patterns,
         priority=payload.priority,

@@ -156,8 +156,10 @@ def run_sync_scan(root_id: Optional[int] = None):
             progress_tracker.set_evaluating_rules()
             rules_engine.evaluate_all_rules(session)
 
-            # 統計產出候選數
-            candidates_count = session.query(Candidate).filter(Candidate.is_keeper == False).count()
+            # 統計產出候選數 (計算不重複之待清理相片資產總數)
+            candidates_count = session.query(
+                func.count(func.distinct(Candidate.asset_id))
+            ).filter(Candidate.is_keeper == False).scalar() or 0
 
             # 5. 完成廣播
             progress_tracker.complete_scan(

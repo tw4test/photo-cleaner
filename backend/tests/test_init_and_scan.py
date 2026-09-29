@@ -9,10 +9,11 @@ from PIL import Image
 
 from app.main import app
 from app.core.database import init_db, SyncSessionLocal
-from app.models.schema import Root, Asset, File, Feature
+from app.models.schema import Root, Asset, File, Feature, Candidate
 from app.services.scanner import scan_directory
 from app.services.pairing import pairing_engine
 from app.services.feature_pipeline import feature_pipeline
+from app.api.scan import run_sync_scan
 
 client = TestClient(app)
 
@@ -70,6 +71,74 @@ def test_scan_and_pairing_mock():
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+def test_duplicate_and_nested_path_handling():
+    temp_parent = tempfile.mkdtemp(prefix="photo_root_parent_")
+    temp_child = os.path.join(temp_parent, "child_folder")
+    os.makedirs(temp_child, exist_ok=True)
+
+    try:
+        # 1. 加入合法目錄
+        res1 = client.post("/api/roots", json={"path": temp_parent, "recursive": True})
+        assert res1.status_code == 200
+        root_id = res1.json()["id"]
+
+        # 2. 嘗試重複加入相同目錄 (應被拒絕)
+        res_dup = client.post("/api/roots", json={"path": temp_parent})
+        assert res_dup.status_code == 400
+        assert "無法重複加入" in res_dup.json()["detail"] or "已在掃描清單" in res_dup.json()["detail"]
+
+        # 3. 嘗試加入已被父目錄遞迴涵蓋之子目錄 (應被拒絕)
+        res_child = client.post("/api/roots", json={"path": temp_child})
+        assert res_child.status_code == 400
+        assert "涵蓋" in res_child.json()["detail"]
+
+        # 清理
+        client.delete(f"/api/roots/{root_id}")
+    finally:
+        shutil.rmtree(temp_parent, ignore_errors=True)
+
+def test_repeated_scan_idempotency_and_candidate_count():
+    temp_dir = tempfile.mkdtemp(prefix="photo_repeat_scan_")
+    try:
+        # 建立 3 張假相片
+        for i in range(3):
+            img_path = Path(temp_dir) / f"photo_{i}.jpg"
+            img = Image.new("RGB", (60, 60), color=(i * 40, i * 40, i * 40))
+            img.save(img_path)
+
+        # 註冊目錄
+        res = client.post("/api/roots", json={"path": temp_dir})
+        assert res.status_code == 200
+        root_id = res.json()["id"]
+
+        # 第一次掃描
+        run_sync_scan(root_id)
+        status1 = client.get("/api/scan/status").json()
+        assert status1["stage"] == "completed"
+        assert status1["total_files"] == 3
+        assert status1["new_assets_count"] == 3
+        assert status1["new_candidates_count"] <= 3  # 候選資產數必定 <= 總資產數 3
+
+        with SyncSessionLocal() as session:
+            asset_count_1 = session.query(Asset).count()
+            assert asset_count_1 == 3
+
+        # 第二次重複掃描 (應為差異跳過，不重複建立資產)
+        run_sync_scan(root_id)
+        status2 = client.get("/api/scan/status").json()
+        assert status2["stage"] == "completed"
+        assert status2["total_files"] == 3
+        assert status2["new_assets_count"] == 0  # 重複掃描時，新資產為 0
+        assert status2["new_candidates_count"] <= 3
+
+        with SyncSessionLocal() as session:
+            asset_count_2 = session.query(Asset).count()
+            assert asset_count_2 == 3  # 資產總數依然維持 3，無重複資產
+
+        client.delete(f"/api/roots/{root_id}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 def test_scan_progress_and_cancel_endpoints():
     # Test getting scan status
     res = client.get("/api/scan/status")
@@ -83,4 +152,3 @@ def test_scan_progress_and_cancel_endpoints():
     res_cancel = client.post("/api/scan/cancel")
     assert res_cancel.status_code == 200
     assert res_cancel.json()["status"] == "ok"
-
