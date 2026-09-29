@@ -8,6 +8,22 @@ export interface RootItem {
   available: boolean
 }
 
+export interface ScanProgressState {
+  is_scanning: boolean
+  stage: 'idle' | 'discovering' | 'processing' | 'evaluating_rules' | 'completed' | 'error'
+  stage_label: string
+  total_files: number
+  processed_files: number
+  percentage: number
+  current_file: string
+  speed_fps: number
+  eta_seconds: number | null
+  new_assets_count: number
+  new_candidates_count: number
+  error_message: string | null
+  duration_seconds: number
+}
+
 export interface DashboardStats {
   assets: {
     total: number

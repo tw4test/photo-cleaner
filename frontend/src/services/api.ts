@@ -6,7 +6,8 @@ import {
   QueuedSummary, 
   DeletionResult, 
   BatchSummaryItem, 
-  ActionLogItem 
+  ActionLogItem,
+  ScanProgressState 
 } from './types'
 
 const apiClient = axios.create({
@@ -23,9 +24,11 @@ export const api = {
     apiClient.post<RootItem>('/roots', data).then(res => res.data),
   deleteRoot: (id: number) => apiClient.delete(`/roots/${id}`).then(res => res.data),
 
-  // Scan
+  // Scan & Live Progress
   triggerScan: (rootId: number) => apiClient.post(`/scan/${rootId}`).then(res => res.data),
   triggerScanAll: () => apiClient.post('/scan/all').then(res => res.data),
+  getScanStatus: () => apiClient.get<ScanProgressState>('/scan/status').then(res => res.data),
+  cancelScan: () => apiClient.post('/scan/cancel').then(res => res.data),
 
   // Dashboard
   getDashboardStats: () => apiClient.get<DashboardStats>('/dashboard/stats').then(res => res.data),

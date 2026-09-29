@@ -69,3 +69,18 @@ def test_scan_and_pairing_mock():
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+def test_scan_progress_and_cancel_endpoints():
+    # Test getting scan status
+    res = client.get("/api/scan/status")
+    assert res.status_code == 200
+    data = res.json()
+    assert "stage" in data
+    assert "percentage" in data
+    assert "processed_files" in data
+
+    # Test cancel endpoint
+    res_cancel = client.post("/api/scan/cancel")
+    assert res_cancel.status_code == 200
+    assert res_cancel.json()["status"] == "ok"
+

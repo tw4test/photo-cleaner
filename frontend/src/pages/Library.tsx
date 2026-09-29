@@ -1,16 +1,20 @@
-import React, { useEffect, useState } from 'react'
-import { FolderPlus, Play, Folder, Trash2, CheckCircle2, Loader2, AlertCircle } from 'lucide-react'
+import React, { useEffect, useState, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { FolderPlus, Play, Folder, Trash2, CheckCircle2, AlertCircle } from 'lucide-react'
 import { api } from '../services/api'
-import { RootItem } from '../services/types'
+import { RootItem, ScanProgressState } from '../services/types'
+import { useScanProgress } from '../hooks/useScanProgress'
+import { ScanProgressBar } from '../components/common/ScanProgressBar'
 
 export const Library: React.FC = () => {
+  const navigate = useNavigate()
   const [roots, setRoots] = useState<RootItem[]>([])
   const [newPath, setNewPath] = useState('')
   const [loading, setLoading] = useState(false)
-  const [scanning, setScanning] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [showProgressCard, setShowProgressCard] = useState(true)
 
-  const loadRoots = async () => {
+  const loadRoots = useCallback(async () => {
     try {
       setLoading(true)
       const data = await api.getRoots()
@@ -20,11 +24,19 @@ export const Library: React.FC = () => {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
+
+  // Hook for real-time scanning progress tracking (SSE + Polling fallback)
+  const { progress, isScanning, cancelScan } = useScanProgress(
+    useCallback((_completedState: ScanProgressState) => {
+      loadRoots()
+      setShowProgressCard(true)
+    }, [loadRoots])
+  )
 
   useEffect(() => {
     loadRoots()
-  }, [])
+  }, [loadRoots])
 
   const handleAddRoot = async () => {
     if (!newPath.trim()) return
@@ -51,22 +63,16 @@ export const Library: React.FC = () => {
 
   const handleTriggerScan = async (rootId?: number) => {
     try {
-      setScanning(true)
       setMessage(null)
+      setShowProgressCard(true)
       if (rootId) {
         await api.triggerScan(rootId)
       } else {
         await api.triggerScanAll()
       }
-      setMessage({ type: 'success', text: '背景掃描與特徵分析已啟動，完成後可在首頁或審核工作台檢視！' })
-      // 短暫延遲後重新載入狀態
-      setTimeout(() => {
-        loadRoots()
-        setScanning(false)
-      }, 2000)
-    } catch (err) {
-      setScanning(false)
-      setMessage({ type: 'error', text: '啟動掃描失敗。' })
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.detail || '啟動掃描失敗。'
+      setMessage({ type: 'error', text: errorMsg })
     }
   }
 
@@ -76,17 +82,27 @@ export const Library: React.FC = () => {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-2xl font-bold text-slate-100">資料庫掃描（Library）</h2>
-          <p className="text-slate-400 text-sm mt-1">管理相片掃描目錄、路徑優先順序與差異掃描</p>
+          <p className="text-slate-400 text-sm mt-1">管理相片掃描目錄、路徑優先順序與即時透明掃描</p>
         </div>
         <button
-          disabled={roots.length === 0 || scanning}
+          disabled={roots.length === 0 || isScanning}
           onClick={() => handleTriggerScan()}
-          className="flex items-center gap-2 px-4 py-2 bg-sky-600 hover:bg-sky-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-sm font-medium transition-all shadow-lg shadow-sky-600/20"
+          className="flex items-center gap-2 px-4 py-2 bg-sky-600 hover:bg-sky-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-sm font-medium transition-all shadow-lg shadow-sky-600/20 cursor-pointer"
         >
-          {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-          <span>{scanning ? '全庫掃描中...' : '開始全庫掃描'}</span>
+          <Play className="w-4 h-4" />
+          <span>{isScanning ? '掃描進行中...' : '開始全庫掃描'}</span>
         </button>
       </div>
+
+      {/* Real-time Transparent Progress Bar Card */}
+      {showProgressCard && (
+        <ScanProgressBar
+          progress={progress}
+          onCancel={cancelScan}
+          onDismiss={() => setShowProgressCard(false)}
+          onNavigateReview={() => navigate('/review')}
+        />
+      )}
 
       {/* Notice Message */}
       {message && (
@@ -114,7 +130,7 @@ export const Library: React.FC = () => {
           />
           <button
             onClick={handleAddRoot}
-            className="flex items-center gap-2 px-5 py-2.5 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-sm font-medium transition-colors shadow-md shadow-sky-600/20"
+            className="flex items-center gap-2 px-5 py-2.5 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-sm font-medium transition-colors shadow-md shadow-sky-600/20 cursor-pointer"
           >
             <FolderPlus className="w-4 h-4" />
             <span>加入路徑</span>
@@ -155,15 +171,16 @@ export const Library: React.FC = () => {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => handleTriggerScan(root.id)}
-                    disabled={scanning}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-medium border border-slate-700 transition-colors"
+                    disabled={isScanning}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 rounded-lg text-xs font-medium border border-slate-700 transition-colors cursor-pointer"
                   >
                     <Play className="w-3.5 h-3.5 text-sky-400" />
                     <span>掃描此目錄</span>
                   </button>
                   <button
                     onClick={() => handleDeleteRoot(root.id)}
-                    className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-rose-950/20 rounded-lg transition-colors"
+                    disabled={isScanning}
+                    className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-rose-950/20 disabled:opacity-40 rounded-lg transition-colors cursor-pointer"
                     title="移除路徑"
                   >
                     <Trash2 className="w-4 h-4" />

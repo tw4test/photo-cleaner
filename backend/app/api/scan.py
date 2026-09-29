@@ -1,11 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+import json
+import asyncio
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from datetime import datetime
 from typing import Dict, Any, Optional
 
 from app.core.database import get_db, SyncSessionLocal
-from app.models.schema import Root, Asset, File, Feature, VideoInfo
+from app.core.progress import progress_tracker
+from app.models.schema import Root, Asset, File, Feature, VideoInfo, Candidate
 from app.services.scanner import scan_directory
 from app.services.pairing import pairing_engine
 from app.services.thumbnail import thumbnail_service
@@ -15,35 +19,57 @@ from app.services.rules_engine import rules_engine
 router = APIRouter(prefix="/api/scan", tags=["scan"])
 
 def run_sync_scan(root_id: Optional[int] = None):
-    """Background task to perform scanning, feature extraction, and candidate generation."""
+    """Background task to perform scanning, feature extraction, and candidate generation with live progress."""
+    progress_tracker.start_scan()
+    
     with SyncSessionLocal() as session:
-        if root_id is not None:
-            roots = [session.get(Root, root_id)]
-        else:
-            roots = session.query(Root).filter(Root.available == True).order_by(Root.priority.asc()).all()
+        try:
+            if root_id is not None:
+                roots = [session.get(Root, root_id)]
+            else:
+                roots = session.query(Root).filter(Root.available == True).order_by(Root.priority.asc()).all()
 
-        for root in roots:
-            if not root:
-                continue
+            # 1. 遍歷目錄統計檔案
+            all_scanned_files = []
+            for root in roots:
+                if not root:
+                    continue
+                files = list(scan_directory(root.path, root.recursive, root.exclude_patterns))
+                for f in files:
+                    f["root_id"] = root.id
+                all_scanned_files.extend(files)
 
-            # 1. 遍歷目錄
-            scanned = list(scan_directory(root.path, root.recursive, root.exclude_patterns))
+            total_discovered = len(all_scanned_files)
+            progress_tracker.set_discovered_total(total_discovered)
 
             # 2. 配對
-            paired_assets = pairing_engine.pair_files(scanned)
+            paired_assets = pairing_engine.pair_files(all_scanned_files)
 
-            # 3. 寫入資料庫
-            for item in paired_assets:
+            # 3. 逐一處理特徵分析與縮圖
+            processed_files_count = 0
+            new_assets_count = 0
+
+            for idx, item in enumerate(paired_assets):
+                if progress_tracker.is_cancel_requested():
+                    break
+
                 primary_file = item["primary_file"]
                 paired_files = item["paired_files"]
+                root_id_for_asset = primary_file.get("root_id", roots[0].id if roots else 1)
 
                 # 檢查是否已存在
                 existing_asset = session.query(Asset).filter(Asset.primary_path == primary_file["path"]).first()
                 if existing_asset:
+                    processed_files_count += 1 + len(paired_files)
+                    progress_tracker.update_progress(
+                        processed=processed_files_count,
+                        current_file=primary_file["path"],
+                        new_assets=new_assets_count
+                    )
                     continue
 
                 asset = Asset(
-                    root_id=root.id,
+                    root_id=root_id_for_asset,
                     media_type=item["media_type"],
                     primary_path=primary_file["path"],
                     size_total=item["size_total"],
@@ -53,6 +79,7 @@ def run_sync_scan(root_id: Optional[int] = None):
                 )
                 session.add(asset)
                 session.flush()
+                new_assets_count += 1
 
                 # 寫入主檔案記錄
                 primary_record = File(
@@ -80,7 +107,7 @@ def run_sync_scan(root_id: Optional[int] = None):
                 # 生成縮圖快取
                 thumbnail_service.generate_thumbnail(primary_file["path"])
 
-                # 提取特徵
+                # 提取特徵 (包含 AI 語義分類)
                 feats = feature_pipeline.extract_features(
                     primary_file["path"],
                     is_raw=(item["media_type"] == "raw"),
@@ -113,14 +140,69 @@ def run_sync_scan(root_id: Optional[int] = None):
                     )
                     session.add(feat_record)
 
-            root.last_scan_at = datetime.utcnow()
+                processed_files_count += 1 + len(paired_files)
+                progress_tracker.update_progress(
+                    processed=processed_files_count,
+                    current_file=primary_file["path"],
+                    new_assets=new_assets_count
+                )
+
+            for r in roots:
+                if r:
+                    r.last_scan_at = datetime.utcnow()
             session.commit()
 
-        # 4. 掃描完成後自動執行規則引擎產出候選
-        rules_engine.evaluate_all_rules(session)
+            # 4. 執行規則引擎產出候選
+            progress_tracker.set_evaluating_rules()
+            rules_engine.evaluate_all_rules(session)
+
+            # 統計產出候選數
+            candidates_count = session.query(Candidate).filter(Candidate.is_keeper == False).count()
+
+            # 5. 完成廣播
+            progress_tracker.complete_scan(
+                new_assets=new_assets_count,
+                new_candidates=candidates_count
+            )
+        except Exception as e:
+            session.rollback()
+            progress_tracker.fail_scan(str(e))
+
+@router.get("/status")
+async def get_scan_status():
+    """取得當前掃描進度狀態"""
+    return progress_tracker.get_state()
+
+@router.get("/events")
+async def scan_events(request: Request):
+    """Server-Sent Events (SSE) 即時推送掃描進度"""
+    async def event_generator():
+        async for state in progress_tracker.subscribe():
+            if await request.is_disconnected():
+                break
+            yield f"data: {json.dumps(state, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+@router.post("/cancel")
+async def cancel_scan():
+    """取消當前正在進行的掃描任務"""
+    progress_tracker.request_cancel()
+    return {"status": "ok", "message": "已發送取消掃描請求"}
 
 @router.post("/all")
 async def trigger_scan_all(background_tasks: BackgroundTasks):
+    if progress_tracker.state.is_scanning:
+        raise HTTPException(status_code=400, detail="目前已有掃描任務進行中")
+
     background_tasks.add_task(run_sync_scan, None)
     return {"status": "ok", "message": "已在背景啟動全庫掃描與規則分析"}
 
@@ -130,6 +212,9 @@ async def trigger_scan(
     background_tasks: BackgroundTasks, 
     db: AsyncSession = Depends(get_db)
 ):
+    if progress_tracker.state.is_scanning:
+        raise HTTPException(status_code=400, detail="目前已有掃描任務進行中")
+
     root = await db.get(Root, root_id)
     if not root:
         raise HTTPException(status_code=404, detail="找不到指定的路徑")
