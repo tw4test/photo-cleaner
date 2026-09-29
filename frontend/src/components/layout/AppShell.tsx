@@ -6,20 +6,22 @@ import {
   Sparkles, 
   Trash2, 
   History as HistoryIcon,
+  Sliders,
   ShieldCheck
 } from 'lucide-react'
 
-interface AppShellProps {
+export interface AppShellProps {
   children: React.ReactNode
 }
 
-export const AppShell: React.FC<AppShellProps> = ({ children }) => {
+export const AppShell = ({ children }: AppShellProps) => {
   const navItems = [
     { to: '/', label: '首頁總覽', icon: LayoutDashboard, exact: true },
     { to: '/library', label: '資料庫掃描', icon: FolderSync },
     { to: '/review', label: '審核工作台', icon: Sparkles },
     { to: '/process', label: '執行刪除', icon: Trash2 },
     { to: '/history', label: '歷史記錄', icon: HistoryIcon },
+    { to: '/settings', label: '系統設定', icon: Sliders },
   ]
 
   return (

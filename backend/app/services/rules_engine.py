@@ -1,11 +1,32 @@
+import json
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import select, and_
 import imagehash
 
 from app.core.config import settings
-from app.models.schema import Asset, File, Feature, Candidate, Group, Root
+from app.models.schema import Asset, File, Feature, Candidate, Group, Root, Setting
 from app.models.enums import CandidateRule, CandidateState, GroupType
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "rule_exact_dup_enabled": True,
+    "rule_near_dup_enabled": True,
+    "rule_burst_enabled": True,
+    "rule_blur_enabled": True,
+    "rule_exposure_enabled": True,
+    "rule_screenshot_enabled": False,
+    "rule_mistouch_enabled": True,
+    "rule_video_same_size_enabled": True,
+    "rule_video_tiny_enabled": False,
+    "phash_threshold": 6,
+    "blur_threshold": 100.0,
+    "under_exposure_threshold": 30.0,
+    "over_exposure_threshold": 225.0,
+    "burst_time_window_seconds": 2.0,
+    "burst_similarity_threshold": 0.85,
+    "video_tiny_threshold_kb": 100,
+    "cross_path_duplicates": True,
+}
 
 class RulesEngine:
     """
@@ -18,27 +39,41 @@ class RulesEngine:
     - 保留最後一張防呆保護 (Keeper Protection)
     """
 
+    def _get_active_config(self, session: Session) -> Dict[str, Any]:
+        """從資料庫載入最新設定"""
+        config = DEFAULT_CONFIG.copy()
+        db_settings = session.query(Setting).all()
+        for s in db_settings:
+            try:
+                config[s.key] = json.loads(s.value)
+            except Exception:
+                config[s.key] = s.value
+        return config
+
     def evaluate_all_rules(self, session: Session):
         """執行所有規則並生成候選資料"""
+        config = self._get_active_config(session)
+
         # 清除舊的候選記錄以利重新評估
         session.query(Candidate).delete()
         session.query(Group).delete()
         session.flush()
 
         # 1. 執行完全重複規則 (Exact Duplicates)
-        self._evaluate_exact_duplicates(session)
+        if config.get("rule_exact_dup_enabled", True):
+            self._evaluate_exact_duplicates(session, config)
 
         # 2. 執行近似重複規則 (Near Duplicates via pHash)
-        self._evaluate_near_duplicates(session)
+        if config.get("rule_near_dup_enabled", True):
+            self._evaluate_near_duplicates(session, config)
 
         # 3. 執行單張質量缺陷規則 (Blur & Exposure)
-        self._evaluate_quality_rules(session)
+        self._evaluate_quality_rules(session, config)
 
         session.commit()
 
-    def _evaluate_exact_duplicates(self, session: Session):
+    def _evaluate_exact_duplicates(self, session: Session, config: Dict[str, Any]):
         """尋找 SHA-256 完全相同的檔案"""
-        # 查詢所有有 SHA-256 的主檔案
         files = (
             session.query(File, Asset, Root)
             .join(Asset, File.asset_id == Asset.id)
@@ -47,7 +82,6 @@ class RulesEngine:
             .all()
         )
 
-        # 按 sha256 分組
         hash_groups: Dict[str, List[tuple[File, Asset, Root]]] = {}
         for f, a, r in files:
             hash_groups.setdefault(f.sha256, []).append((f, a, r))
@@ -56,12 +90,10 @@ class RulesEngine:
             if len(group_items) < 2:
                 continue
 
-            # 建立 Group
             group = Group(type=GroupType.EXACT.value)
             session.add(group)
             session.flush()
 
-            # 排序選出 Keeper: 1. Root Priority 越小越優, 2. 檔案尺寸最大, 3. 舊檔案優先
             sorted_items = sorted(
                 group_items,
                 key=lambda x: (x[2].priority, -x[1].size_total, x[0].mtime)
@@ -70,7 +102,6 @@ class RulesEngine:
             keeper_file, keeper_asset, _ = sorted_items[0]
             group.keeper_asset_id = keeper_asset.id
 
-            # 加入 Keeper 候選記錄
             session.add(Candidate(
                 asset_id=keeper_asset.id,
                 rule=CandidateRule.EXACT_DUP.value,
@@ -81,7 +112,6 @@ class RulesEngine:
                 state=CandidateState.CANDIDATE.value
             ))
 
-            # 加入其餘重複項目為待刪建議
             for f, a, r in sorted_items[1:]:
                 session.add(Candidate(
                     asset_id=a.id,
@@ -93,9 +123,10 @@ class RulesEngine:
                     state=CandidateState.CANDIDATE.value
                 ))
 
-    def _evaluate_near_duplicates(self, session: Session):
+    def _evaluate_near_duplicates(self, session: Session, config: Dict[str, Any]):
         """利用 pHash 感知雜湊距離分組尋找近似圖片"""
-        # 排除已經在完全重複組內的資產
+        phash_threshold = int(config.get("phash_threshold", 6))
+
         existing_candidate_asset_ids = {
             c.asset_id for c in session.query(Candidate.asset_id).all()
         }
@@ -112,8 +143,7 @@ class RulesEngine:
             .all()
         )
 
-        # 兩兩比對 pHash 距離
-        matched_pairs: List[tuple[int, int, int]] = []  # (idx1, idx2, distance)
+        matched_pairs: List[tuple[int, int, int]] = []
         for i in range(len(features)):
             feat1, a1, r1 = features[i]
             try:
@@ -126,12 +156,11 @@ class RulesEngine:
                 try:
                     h2 = imagehash.hex_to_hash(feat2.phash)
                     dist = h1 - h2
-                    if dist <= settings.PHASH_DISTANCE_THRESHOLD:
+                    if dist <= phash_threshold:
                         matched_pairs.append((i, j, dist))
                 except Exception:
                     continue
 
-        # 簡單聚類
         clusters: List[set[int]] = []
         for i, j, _ in matched_pairs:
             found = False
@@ -153,7 +182,6 @@ class RulesEngine:
             session.add(group)
             session.flush()
 
-            # 依清晰度 (blur_score 越高越優) 與路徑優先序排序選出 Keeper
             sorted_items = sorted(
                 items,
                 key=lambda x: (x[2].priority, -(x[0].blur_score or 0.0), -x[1].size_total)
@@ -183,8 +211,14 @@ class RulesEngine:
                     state=CandidateState.CANDIDATE.value
                 ))
 
-    def _evaluate_quality_rules(self, session: Session):
+    def _evaluate_quality_rules(self, session: Session, config: Dict[str, Any]):
         """評估單張圖片質量：模糊、過曝、過暗"""
+        blur_enabled = config.get("rule_blur_enabled", True)
+        exposure_enabled = config.get("rule_exposure_enabled", True)
+        blur_threshold = float(config.get("blur_threshold", 100.0))
+        under_exp_threshold = float(config.get("under_exposure_threshold", 30.0))
+        over_exp_threshold = float(config.get("over_exposure_threshold", 225.0))
+
         features = (
             session.query(Feature, Asset)
             .join(Asset, Feature.asset_id == Asset.id)
@@ -194,35 +228,35 @@ class RulesEngine:
 
         for feat, asset in features:
             # 1. 模糊檢查
-            if feat.blur_score is not None and feat.blur_score < settings.BLUR_THRESHOLD:
+            if blur_enabled and feat.blur_score is not None and feat.blur_score < blur_threshold:
                 session.add(Candidate(
                     asset_id=asset.id,
                     rule=CandidateRule.BLUR.value,
-                    reason=f"相片模糊（清晰度分數 {feat.blur_score:.1f} < 門檻 {settings.BLUR_THRESHOLD:.0f}）",
-                    score=round(1.0 - (feat.blur_score / settings.BLUR_THRESHOLD), 2),
+                    reason=f"相片模糊（清晰度分數 {feat.blur_score:.1f} < 門檻 {blur_threshold:.0f}）",
+                    score=round(1.0 - (feat.blur_score / blur_threshold), 2),
                     group_id=None,
                     is_keeper=False,
                     state=CandidateState.CANDIDATE.value
                 ))
 
             # 2. 過暗檢查
-            if feat.brightness is not None and feat.brightness < settings.UNDER_EXPOSURE_THRESHOLD:
+            if exposure_enabled and feat.brightness is not None and feat.brightness < under_exp_threshold:
                 session.add(Candidate(
                     asset_id=asset.id,
                     rule=CandidateRule.UNDER_EXPOSURE.value,
-                    reason=f"相片過暗（平均亮度 {feat.brightness:.1f} < 門檻 {settings.UNDER_EXPOSURE_THRESHOLD:.0f}）",
-                    score=round(1.0 - (feat.brightness / settings.UNDER_EXPOSURE_THRESHOLD), 2),
+                    reason=f"相片過暗（平均亮度 {feat.brightness:.1f} < 門檻 {under_exp_threshold:.0f}）",
+                    score=round(1.0 - (feat.brightness / under_exp_threshold), 2),
                     group_id=None,
                     is_keeper=False,
                     state=CandidateState.CANDIDATE.value
                 ))
             # 3. 過曝檢查
-            elif feat.brightness is not None and feat.brightness > settings.OVER_EXPOSURE_THRESHOLD:
+            elif exposure_enabled and feat.brightness is not None and feat.brightness > over_exp_threshold:
                 session.add(Candidate(
                     asset_id=asset.id,
                     rule=CandidateRule.OVER_EXPOSURE.value,
-                    reason=f"相片過曝（平均亮度 {feat.brightness:.1f} > 門檻 {settings.OVER_EXPOSURE_THRESHOLD:.0f}）",
-                    score=round((feat.brightness - settings.OVER_EXPOSURE_THRESHOLD) / (255 - settings.OVER_EXPOSURE_THRESHOLD), 2),
+                    reason=f"相片過曝（平均亮度 {feat.brightness:.1f} > 門檻 {over_exp_threshold:.0f}）",
+                    score=round((feat.brightness - over_exp_threshold) / (255 - over_exp_threshold), 2),
                     group_id=None,
                     is_keeper=False,
                     state=CandidateState.CANDIDATE.value
@@ -234,22 +268,16 @@ class RulesEngine:
         若用戶嘗試將同一個重複組內的「所有」資產都標記為待刪/刪除，
         系統強制攔截並保留原先的 Keeper 不予加入待刪。
         """
-        # 查出這些 candidates 所屬的 group_id
         candidates = session.query(Candidate).filter(Candidate.id.in_(candidate_ids_to_queue)).all()
-        group_ids = {c.group_id for c in candidates if c.group_id is not None}
-
         safe_candidate_ids = []
         for c in candidates:
-            # 如果是 Keeper 且用戶試圖全選待刪
             if c.is_keeper:
-                # 檢查該組是否所有其他成員也被選中
                 other_members = session.query(Candidate).filter(
                     Candidate.group_id == c.group_id,
                     Candidate.id != c.id
                 ).all()
                 all_others_queued = all(m.id in candidate_ids_to_queue for m in other_members)
                 if all_others_queued:
-                    # 觸發保護：跳過 Keeper
                     continue
             safe_candidate_ids.append(c.id)
 

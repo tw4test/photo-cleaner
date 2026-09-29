@@ -5,6 +5,7 @@ import { Library } from './pages/Library'
 import { Review } from './pages/Review'
 import { Process } from './pages/Process'
 import { History } from './pages/History'
+import { Settings } from './pages/Settings'
 
 function App() {
   return (
@@ -16,6 +17,7 @@ function App() {
           <Route path="/review" element={<Review />} />
           <Route path="/process" element={<Process />} />
           <Route path="/history" element={<History />} />
+          <Route path="/settings" element={<Settings />} />
         </Routes>
       </AppShell>
     </BrowserRouter>

@@ -47,4 +47,10 @@ export const api = {
   // History
   getHistoryBatches: () => apiClient.get<BatchSummaryItem[]>('/history/batches').then(res => res.data),
   getBatchDetails: (batchId: string) => apiClient.get<ActionLogItem[]>(`/history/batches/${batchId}`).then(res => res.data),
+
+  // Settings
+  getSettings: () => apiClient.get<Record<string, any>>('/settings').then(res => res.data),
+  updateSettings: (settings: Record<string, any>, reEvaluate: boolean = true) =>
+    apiClient.put('/settings', { settings, re_evaluate: reEvaluate }).then(res => res.data),
+  resetSettings: () => apiClient.post('/settings/reset').then(res => res.data),
 }
