@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { 
   Images, 
@@ -7,16 +7,55 @@ import {
   Sparkles, 
   ArrowRight, 
   CheckCircle2, 
-  AlertCircle 
+  AlertCircle,
+  RefreshCw
 } from 'lucide-react'
+import { api } from '../services/api'
+import { DashboardStats } from '../services/types'
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0.00 MB'
+  const k = 1024
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`
+}
 
 export const Dashboard: React.FC = () => {
+  const [stats, setStats] = useState<DashboardStats | null>(null)
+  const [loading, setLoading] = useState<boolean>(true)
+
+  const loadStats = async () => {
+    try {
+      setLoading(true)
+      const data = await api.getDashboardStats()
+      setStats(data)
+    } catch (err) {
+      console.error('Failed to load dashboard stats:', err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadStats()
+  }, [])
+
   return (
     <div className="p-8 space-y-8 overflow-y-auto max-w-7xl mx-auto w-full">
       {/* Header */}
-      <div>
-        <h2 className="text-2xl font-bold text-slate-100">首頁總覽</h2>
-        <p className="text-slate-400 text-sm mt-1">本地相片庫分析與瘦身建議統計</p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-slate-100">首頁總覽</h2>
+          <p className="text-slate-400 text-sm mt-1">本地相片庫分析與瘦身建議統計</p>
+        </div>
+        <button
+          onClick={loadStats}
+          className="flex items-center gap-2 px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-medium border border-slate-700 transition-colors"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+          <span>重新整理統計</span>
+        </button>
       </div>
 
       {/* Stats Cards */}
@@ -27,8 +66,12 @@ export const Dashboard: React.FC = () => {
             <Images className="w-5 h-5 text-sky-400" />
           </div>
           <div className="mt-4">
-            <div className="text-3xl font-bold text-slate-100 font-mono">0</div>
-            <div className="text-xs text-slate-500 mt-1">相片 0 ｜ RAW 0 ｜ 影片 0</div>
+            <div className="text-3xl font-bold text-slate-100 font-mono">
+              {stats?.assets.total ?? 0}
+            </div>
+            <div className="text-xs text-slate-500 mt-1">
+              相片 {stats?.assets.photo_count ?? 0} ｜ RAW {stats?.assets.raw_count ?? 0} ｜ 影片 {stats?.assets.video_count ?? 0}
+            </div>
           </div>
         </div>
 
@@ -38,8 +81,12 @@ export const Dashboard: React.FC = () => {
             <Sparkles className="w-5 h-5 text-amber-400" />
           </div>
           <div className="mt-4">
-            <div className="text-3xl font-bold text-amber-400 font-mono">0</div>
-            <div className="text-xs text-slate-500 mt-1">完全重複 0 ｜ 近似 0 ｜ 廢片 0</div>
+            <div className="text-3xl font-bold text-amber-400 font-mono">
+              {stats?.candidates.total ?? 0}
+            </div>
+            <div className="text-xs text-slate-500 mt-1">
+              完全重複 {stats?.candidates.exact_dup ?? 0} ｜ 模糊 {stats?.candidates.blur ?? 0} ｜ 曝光異常 {stats?.candidates.exposure ?? 0}
+            </div>
           </div>
         </div>
 
@@ -49,8 +96,12 @@ export const Dashboard: React.FC = () => {
             <HardDrive className="w-5 h-5 text-emerald-400" />
           </div>
           <div className="mt-4">
-            <div className="text-3xl font-bold text-emerald-400 font-mono">0.00 GB</div>
-            <div className="text-xs text-slate-500 mt-1">佔比 0%</div>
+            <div className="text-3xl font-bold text-emerald-400 font-mono">
+              {formatBytes(stats?.candidates.releasable_size_bytes ?? 0)}
+            </div>
+            <div className="text-xs text-slate-500 mt-1">
+              總資料庫佔比 {stats && stats.assets.total_size_bytes > 0 ? ((stats.candidates.releasable_size_bytes / stats.assets.total_size_bytes) * 100).toFixed(1) : 0}%
+            </div>
           </div>
         </div>
 
@@ -60,8 +111,12 @@ export const Dashboard: React.FC = () => {
             <Trash2 className="w-5 h-5 text-purple-400" />
           </div>
           <div className="mt-4">
-            <div className="text-3xl font-bold text-purple-400 font-mono">0.00 GB</div>
-            <div className="text-xs text-slate-500 mt-1">已執行 0 批次</div>
+            <div className="text-3xl font-bold text-purple-400 font-mono">
+              {formatBytes(stats?.history.deleted_size_bytes ?? 0)}
+            </div>
+            <div className="text-xs text-slate-500 mt-1">
+              已執行 {stats?.history.deleted_batches ?? 0} 批次
+            </div>
           </div>
         </div>
       </div>
@@ -71,17 +126,21 @@ export const Dashboard: React.FC = () => {
         <div className="space-y-1">
           <div className="flex items-center gap-2 text-sky-400 font-semibold text-base">
             <CheckCircle2 className="w-5 h-5" />
-            <span>目前尚未加入任何掃描路徑</span>
+            <span>
+              {(stats?.assets.total ?? 0) === 0 ? '目前尚未掃描任何相片資產' : `已完成 ${stats?.assets.total} 張相片分析`}
+            </span>
           </div>
           <p className="text-slate-400 text-sm">
-            請先至「資料庫掃描」頁面加入本機相片資料夾，系統將進行差異掃描與配對。
+            {(stats?.assets.total ?? 0) === 0
+              ? '請先至「資料庫掃描」頁面加入本機相片資料夾並執行掃描。'
+              : `偵測到 ${stats?.candidates.total} 個候選瘦身項目，點擊前往審核工作台確認。`}
           </p>
         </div>
         <Link
-          to="/library"
+          to={(stats?.assets.total ?? 0) === 0 ? "/library" : "/review"}
           className="flex items-center gap-2 px-5 py-2.5 bg-sky-600 hover:bg-sky-500 text-white rounded-xl font-medium transition-all shadow-lg shadow-sky-600/20"
         >
-          <span>前往設定路徑</span>
+          <span>{(stats?.assets.total ?? 0) === 0 ? "前往設定路徑" : "前往審核工作台"}</span>
           <ArrowRight className="w-4 h-4" />
         </Link>
       </div>

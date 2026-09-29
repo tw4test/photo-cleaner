@@ -1,0 +1,125 @@
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, update
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+import os
+
+from app.core.database import get_db, SyncSessionLocal
+from app.models.schema import Candidate, Asset, Feature, Group
+from app.models.enums import CandidateState, CandidateRule
+from app.services.rules_engine import rules_engine
+
+router = APIRouter(prefix="/api/candidates", tags=["candidates"])
+
+class CandidateItemResponse(BaseModel):
+    id: int
+    asset_id: int
+    filename: str
+    primary_path: str
+    media_type: str
+    size_total: int
+    rule: str
+    reason: str
+    score: float
+    group_id: Optional[int] = None
+    is_keeper: bool
+    state: str
+    thumbnail_url: str
+
+class BatchStatusUpdate(BaseModel):
+    candidate_ids: List[int]
+    state: str  # "queued" | "kept" | "candidate"
+
+@router.get("", response_model=List[CandidateItemResponse])
+async def list_candidates(
+    rule: Optional[str] = Query(None, description="篩選特定規則"),
+    state: Optional[str] = Query(None, description="候選狀態: candidate, queued, kept"),
+    media_type: Optional[str] = Query(None, description="photo, raw, video"),
+    db: AsyncSession = Depends(get_db)
+):
+    query = (
+        select(Candidate, Asset)
+        .join(Asset, Candidate.asset_id == Asset.id)
+        .where(Asset.status != "deleted")
+    )
+
+    if rule and rule != "all":
+        if rule == "exposure":
+            query = query.where(Candidate.rule.in_(["over_exposure", "under_exposure"]))
+        else:
+            query = query.where(Candidate.rule == rule)
+
+    if state:
+        query = query.where(Candidate.state == state)
+
+    if media_type:
+        query = query.where(Asset.media_type == media_type)
+
+    query = query.order_by(Candidate.group_id.desc().nullslast(), Candidate.score.desc())
+    result = await db.execute(query)
+    rows = result.all()
+
+    candidates_list = []
+    for cand, asset in rows:
+        filename = os.path.basename(asset.primary_path)
+        candidates_list.append(CandidateItemResponse(
+            id=cand.id,
+            asset_id=asset.id,
+            filename=filename,
+            primary_path=asset.primary_path,
+            media_type=asset.media_type,
+            size_total=asset.size_total,
+            rule=cand.rule,
+            reason=cand.reason,
+            score=cand.score,
+            group_id=cand.group_id,
+            is_keeper=cand.is_keeper,
+            state=cand.state,
+            thumbnail_url=f"/api/thumbnails/{asset.id}"
+        ))
+
+    return candidates_list
+
+@router.post("/batch-status")
+async def batch_update_status(
+    payload: BatchStatusUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    if payload.state not in ["queued", "kept", "candidate"]:
+        raise HTTPException(status_code=400, detail="不合法的狀態值")
+
+    # 在 Sync Session 中檢查鐵則 3：保留最後一張保護
+    with SyncSessionLocal() as sync_session:
+        target_ids = payload.candidate_ids
+        if payload.state == "queued":
+            target_ids = rules_engine.ensure_keeper_protection(sync_session, payload.candidate_ids)
+
+        # 更新 Candidate state
+        sync_session.query(Candidate).filter(Candidate.id.in_(target_ids)).update(
+            {"state": payload.state}, synchronize_session=False
+        )
+
+        # 同步更新 Asset status
+        asset_status = "queued" if payload.state == "queued" else "kept" if payload.state == "kept" else "candidate"
+        asset_ids_subquery = sync_session.query(Candidate.asset_id).filter(Candidate.id.in_(target_ids))
+        sync_session.query(Asset).filter(Asset.id.in_(asset_ids_subquery)).update(
+            {"status": asset_status}, synchronize_session=False
+        )
+
+        sync_session.commit()
+
+    return {
+        "status": "ok",
+        "updated_count": len(target_ids),
+        "target_state": payload.state,
+        "protected_count": len(payload.candidate_ids) - len(target_ids)
+    }
+
+@router.post("/evaluate")
+async def evaluate_rules():
+    """重新執行偵測規則引擎"""
+    with SyncSessionLocal() as session:
+        rules_engine.evaluate_all_rules(session)
+    return {"status": "ok", "message": "已重新評估所有規則並產出候選項目"}

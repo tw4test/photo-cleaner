@@ -1,64 +1,77 @@
-import React, { useState, useRef } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { 
   Filter, 
   Trash2, 
   ShieldAlert, 
   Check, 
-  Image as ImageIcon
+  RefreshCw,
+  Sparkles
 } from 'lucide-react'
-
-// Generate 500 fake mock candidate items for virtual scrolling demonstration
-interface MockItem {
-  id: number
-  filename: string
-  rule: string
-  reason: string
-  score: number
-  size: string
-  isKeeper: boolean
-  status: 'candidate' | 'queued' | 'kept'
-  mediaType: 'photo' | 'raw' | 'video'
-}
-
-const mockCandidates: MockItem[] = Array.from({ length: 500 }, (_, i) => ({
-  id: i + 1,
-  filename: `IMG_${20240000 + i}.${i % 5 === 0 ? 'CR3' : i % 8 === 0 ? 'MOV' : 'JPG'}`,
-  rule: i % 4 === 0 ? '完全重複' : i % 4 === 1 ? '模糊' : i % 4 === 2 ? '過曝' : '連拍多餘',
-  reason: i % 4 === 0 ? 'SHA-256 完全相同' : i % 4 === 1 ? '模糊分數 32.4 < 100' : i % 4 === 2 ? '曝光值 245 > 225' : '與鄰近相片相似度 96%',
-  score: Number((Math.random() * 0.9 + 0.1).toFixed(2)),
-  size: `${(Math.random() * 12 + 1.5).toFixed(1)} MB`,
-  isKeeper: i % 10 === 0,
-  status: 'candidate',
-  mediaType: i % 5 === 0 ? 'raw' : i % 8 === 0 ? 'video' : 'photo',
-}))
+import { Link } from 'react-router-dom'
+import { api } from '../services/api'
+import { CandidateItem } from '../services/types'
 
 const COLUMNS = 4
 
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0.00 MB'
+  const k = 1024
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`
+}
+
+function getRuleBadgeText(rule: string): string {
+  switch (rule) {
+    case 'exact_dup': return '完全重複'
+    case 'near_dup': return '近似重複'
+    case 'blur': return '模糊相片'
+    case 'over_exposure': return '相片過曝'
+    case 'under_exposure': return '相片過暗'
+    case 'burst': return '連拍多餘'
+    case 'screenshot': return '螢幕截圖'
+    default: return rule
+  }
+}
+
 export const Review: React.FC = () => {
-  const [items, setItems] = useState<MockItem[]>(mockCandidates)
+  const [items, setItems] = useState<CandidateItem[]>([])
+  const [loading, setLoading] = useState<boolean>(true)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [activeCategory, setActiveCategory] = useState<string>('all')
+  const [activeState, setActiveState] = useState<'candidate' | 'queued' | 'kept'>('candidate')
+  const [actionMessage, setActionMessage] = useState<string | null>(null)
 
   const parentRef = useRef<HTMLDivElement>(null)
 
-  // Filter items based on activeCategory
-  const filteredItems = items.filter(item => {
-    if (activeCategory === 'all') return true
-    if (activeCategory === 'exact') return item.rule === '完全重複'
-    if (activeCategory === 'blur') return item.rule === '模糊'
-    if (activeCategory === 'exposure') return item.rule === '過曝'
-    if (activeCategory === 'burst') return item.rule === '連拍多餘'
-    return true
-  })
+  const loadCandidates = async () => {
+    try {
+      setLoading(true)
+      const data = await api.getCandidates({ 
+        rule: activeCategory === 'all' ? undefined : activeCategory,
+        state: activeState 
+      })
+      setItems(data)
+      setSelectedIds(new Set())
+    } catch (err) {
+      console.error('Failed to load candidates:', err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadCandidates()
+  }, [activeCategory, activeState])
 
   // Calculate rows for TanStack Virtual
-  const rowCount = Math.ceil(filteredItems.length / COLUMNS)
+  const rowCount = Math.ceil(items.length / COLUMNS)
 
   const rowVirtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 290,
+    estimateSize: () => 300,
     overscan: 3,
   })
 
@@ -69,14 +82,22 @@ export const Review: React.FC = () => {
     setSelectedIds(next)
   }
 
-  const markSelectedAsQueued = () => {
-    setItems(prev => prev.map(item => selectedIds.has(item.id) ? { ...item, status: 'queued' } : item))
-    setSelectedIds(new Set())
-  }
-
-  const markSelectedAsKept = () => {
-    setItems(prev => prev.map(item => selectedIds.has(item.id) ? { ...item, status: 'kept' } : item))
-    setSelectedIds(new Set())
+  const handleUpdateStatus = async (targetState: 'queued' | 'kept' | 'candidate') => {
+    if (selectedIds.size === 0) return
+    try {
+      const idsArray = Array.from(selectedIds)
+      const res: any = await api.updateBatchStatus(idsArray, targetState)
+      
+      let msg = targetState === 'queued' ? `已將 ${res.updated_count} 項加入待刪清單` : `已將 ${res.updated_count} 項標記為排除保留`
+      if (res.protected_count > 0) {
+        msg += `（觸發鐵則 3 保護：已為您保留 ${res.protected_count} 張 Keeper 避免重複組全滅）`
+      }
+      setActionMessage(msg)
+      setTimeout(() => setActionMessage(null), 4000)
+      loadCandidates()
+    } catch (err) {
+      console.error('Failed to batch update candidates:', err)
+    }
   }
 
   return (
@@ -90,11 +111,11 @@ export const Review: React.FC = () => {
           </h3>
           <div className="mt-3 space-y-1.5">
             {[
-              { id: 'all', label: '全部候選', count: items.length },
-              { id: 'exact', label: '完全重複', count: items.filter(i => i.rule === '完全重複').length },
-              { id: 'blur', label: '模糊相片', count: items.filter(i => i.rule === '模糊').length },
-              { id: 'exposure', label: '過暗 / 過曝', count: items.filter(i => i.rule === '過曝').length },
-              { id: 'burst', label: '連拍多餘', count: items.filter(i => i.rule === '連拍多餘').length },
+              { id: 'all', label: '全部候選' },
+              { id: 'exact_dup', label: '完全重複' },
+              { id: 'near_dup', label: '近似重複' },
+              { id: 'blur', label: '模糊相片' },
+              { id: 'exposure', label: '過暗 / 過曝' },
             ].map(cat => (
               <button
                 key={cat.id}
@@ -106,11 +127,39 @@ export const Review: React.FC = () => {
                 }`}
               >
                 <span>{cat.label}</span>
-                <span className="text-xs px-2 py-0.5 rounded-md bg-slate-800 font-mono text-slate-400">
-                  {cat.count}
-                </span>
               </button>
             ))}
+          </div>
+        </div>
+
+        {/* State Filter */}
+        <div className="border-t border-slate-800 pt-4">
+          <h4 className="text-xs font-semibold text-slate-400 mb-2">審核狀態切換</h4>
+          <div className="grid grid-cols-3 gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
+            <button
+              onClick={() => setActiveState('candidate')}
+              className={`py-1.5 rounded-lg font-medium transition-all ${
+                activeState === 'candidate' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              候選
+            </button>
+            <button
+              onClick={() => setActiveState('queued')}
+              className={`py-1.5 rounded-lg font-medium transition-all ${
+                activeState === 'queued' ? 'bg-rose-600 text-white' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              待刪
+            </button>
+            <button
+              onClick={() => setActiveState('kept')}
+              className={`py-1.5 rounded-lg font-medium transition-all ${
+                activeState === 'kept' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              已排除
+            </button>
           </div>
         </div>
 
@@ -120,7 +169,7 @@ export const Review: React.FC = () => {
             <ShieldAlert className="w-4 h-4 text-emerald-400" />
             <span>安全防護鐵則</span>
           </div>
-          <p>Review 頁的任何動作僅變更資料庫狀態，不會刪除任何實體檔案。</p>
+          <p>Review 頁的所有審核動作僅變更資料庫狀態，絕不對實體檔案進行刪除。</p>
         </div>
       </aside>
 
@@ -130,21 +179,33 @@ export const Review: React.FC = () => {
         <div className="p-4 border-b border-slate-800 bg-slate-900/30 flex items-center justify-between">
           <div className="flex items-center gap-4 text-sm">
             <span className="text-slate-400">
-              篩選結果：<strong className="text-slate-100 font-mono">{filteredItems.length}</strong> 項
+              篩選結果：<strong className="text-slate-100 font-mono">{items.length}</strong> 項
             </span>
             {selectedIds.size > 0 && (
               <span className="text-sky-400 font-medium">
                 已選取 <strong className="font-mono">{selectedIds.size}</strong> 項
               </span>
             )}
+            {actionMessage && (
+              <span className="text-xs px-2.5 py-1 bg-sky-950/60 border border-sky-800 text-sky-300 rounded-lg animate-fade-in">
+                {actionMessage}
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedIds(new Set(filteredItems.map(i => i.id)))}
+              onClick={loadCandidates}
+              className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium border border-slate-700 transition-colors"
+              title="重新整理"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              onClick={() => setSelectedIds(new Set(items.map(i => i.id)))}
               className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium border border-slate-700"
             >
-              全選本頁
+              全選
             </button>
             <button
               onClick={() => setSelectedIds(new Set())}
@@ -155,7 +216,7 @@ export const Review: React.FC = () => {
             <div className="h-4 w-px bg-slate-700 mx-1" />
             <button
               disabled={selectedIds.size === 0}
-              onClick={markSelectedAsKept}
+              onClick={() => handleUpdateStatus('kept')}
               className="flex items-center gap-1.5 px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-xs font-medium border border-slate-700"
             >
               <Check className="w-3.5 h-3.5" />
@@ -163,7 +224,7 @@ export const Review: React.FC = () => {
             </button>
             <button
               disabled={selectedIds.size === 0}
-              onClick={markSelectedAsQueued}
+              onClick={() => handleUpdateStatus('queued')}
               className="flex items-center gap-1.5 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-xs font-medium shadow-md shadow-rose-600/20"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -172,96 +233,137 @@ export const Review: React.FC = () => {
           </div>
         </div>
 
-        {/* Virtualized Grid */}
-        <div ref={parentRef} className="flex-1 overflow-y-auto p-6">
-          <div
-            style={{
-              height: `${rowVirtualizer.getTotalSize()}px`,
-              width: '100%',
-              position: 'relative',
-            }}
-          >
-            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-              const startIndex = virtualRow.index * COLUMNS
-              const rowItems = filteredItems.slice(startIndex, startIndex + COLUMNS)
-
-              return (
-                <div
-                  key={virtualRow.key}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    height: `${virtualRow.size}px`,
-                    transform: `translateY(${virtualRow.start}px)`,
-                  }}
-                  className="grid grid-cols-4 gap-5 pb-5"
-                >
-                  {rowItems.map((item) => {
-                    const isSelected = selectedIds.has(item.id)
-                    return (
-                      <div
-                        key={item.id}
-                        onClick={() => toggleSelect(item.id)}
-                        className={`group relative bg-slate-900 border rounded-2xl p-3 flex flex-col cursor-pointer transition-all ${
-                          isSelected
-                            ? 'border-sky-500 ring-2 ring-sky-500/50 bg-sky-950/20 shadow-lg'
-                            : item.isKeeper
-                            ? 'border-emerald-500/60 bg-emerald-950/10'
-                            : 'border-slate-800 hover:border-slate-700'
-                        }`}
-                      >
-                        {/* Mock Image Placeholder */}
-                        <div className="relative aspect-[4/3] bg-slate-950 rounded-xl overflow-hidden flex flex-col items-center justify-center border border-slate-800/80">
-                          <ImageIcon className="w-10 h-10 text-slate-700 group-hover:scale-110 transition-transform" />
-                          <span className="text-[11px] font-mono text-slate-600 mt-2">
-                            Mock 縮圖 #{item.id}
-                          </span>
-
-                          {/* Media tag */}
-                          <span className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-slate-900/80 backdrop-blur-sm text-[10px] font-mono font-bold text-slate-300 border border-slate-700">
-                            {item.mediaType.toUpperCase()}
-                          </span>
-
-                          {/* Keeper Badge */}
-                          {item.isKeeper && (
-                            <span className="absolute top-2 right-2 px-2 py-0.5 rounded-md bg-emerald-600/90 text-[10px] font-bold text-white shadow">
-                              建議保留
-                            </span>
-                          )}
-
-                          {/* Status Tag */}
-                          {item.status !== 'candidate' && (
-                            <span className={`absolute bottom-2 right-2 px-2 py-0.5 rounded-md text-[10px] font-bold ${
-                              item.status === 'queued' ? 'bg-rose-600 text-white' : 'bg-emerald-600 text-white'
-                            }`}>
-                              {item.status === 'queued' ? '待刪' : '已排除'}
-                            </span>
-                          )}
-                        </div>
-
-                        {/* Card Info */}
-                        <div className="mt-3 space-y-1">
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="font-mono text-slate-200 truncate font-semibold">
-                              {item.filename}
-                            </span>
-                            <span className="text-slate-500 font-mono text-[11px]">{item.size}</span>
-                          </div>
-                          <div className="flex items-center justify-between text-[11px]">
-                            <span className="text-amber-400 font-medium">{item.rule}</span>
-                            <span className="text-slate-500 font-mono">{item.reason}</span>
-                          </div>
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              )
-            })}
+        {/* Virtualized Grid or Empty State */}
+        {loading ? (
+          <div className="flex-1 flex items-center justify-center text-slate-500">
+            <RefreshCw className="w-6 h-6 animate-spin mr-2" />
+            <span>載入候選相片中...</span>
           </div>
-        </div>
+        ) : items.length === 0 ? (
+          <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4">
+            <div className="p-4 bg-slate-900 border border-slate-800 rounded-2xl">
+              <Sparkles className="w-10 h-10 text-sky-400 mx-auto" />
+            </div>
+            <div>
+              <h3 className="text-lg font-semibold text-slate-200">目前此分類無任何候選相片</h3>
+              <p className="text-slate-500 text-sm mt-1">
+                若尚未掃描資料夾，請先至「資料庫掃描」頁面加入路徑並執行掃描。
+              </p>
+            </div>
+            <Link
+              to="/library"
+              className="flex items-center gap-2 px-5 py-2.5 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-sm font-medium transition-all shadow-lg shadow-sky-600/20"
+            >
+              <span>前往資料庫掃描</span>
+            </Link>
+          </div>
+        ) : (
+          <div ref={parentRef} className="flex-1 overflow-y-auto p-6">
+            <div
+              style={{
+                height: `${rowVirtualizer.getTotalSize()}px`,
+                width: '100%',
+                position: 'relative',
+              }}
+            >
+              {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                const startIndex = virtualRow.index * COLUMNS
+                const rowItems = items.slice(startIndex, startIndex + COLUMNS)
+
+                return (
+                  <div
+                    key={virtualRow.key}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      height: `${virtualRow.size}px`,
+                      transform: `translateY(${virtualRow.start}px)`,
+                    }}
+                    className="grid grid-cols-4 gap-5 pb-5"
+                  >
+                    {rowItems.map((item) => {
+                      const isSelected = selectedIds.has(item.id)
+                      return (
+                        <div
+                          key={item.id}
+                          onClick={() => toggleSelect(item.id)}
+                          className={`group relative bg-slate-900 border rounded-2xl p-3 flex flex-col cursor-pointer transition-all ${
+                            isSelected
+                              ? 'border-sky-500 ring-2 ring-sky-500/50 bg-sky-950/20 shadow-lg'
+                              : item.is_keeper
+                              ? 'border-emerald-500/60 bg-emerald-950/10'
+                              : 'border-slate-800 hover:border-slate-700'
+                          }`}
+                        >
+                          {/* Real Thumbnail Image */}
+                          <div className="relative aspect-[4/3] bg-slate-950 rounded-xl overflow-hidden flex flex-col items-center justify-center border border-slate-800/80">
+                            <img
+                              src={item.thumbnail_url}
+                              alt={item.filename}
+                              loading="lazy"
+                              className="w-full h-full object-cover group-hover:scale-105 transition-transform"
+                              onError={(e) => {
+                                (e.target as HTMLElement).style.display = 'none'
+                              }}
+                            />
+
+                            {/* Media tag */}
+                            <span className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-slate-900/80 backdrop-blur-sm text-[10px] font-mono font-bold text-slate-300 border border-slate-700">
+                              {item.media_type.toUpperCase()}
+                            </span>
+
+                            {/* Keeper Badge */}
+                            {item.is_keeper && (
+                              <span className="absolute top-2 right-2 px-2 py-0.5 rounded-md bg-emerald-600/90 text-[10px] font-bold text-white shadow">
+                                建議保留
+                              </span>
+                            )}
+
+                            {/* Group Tag */}
+                            {item.group_id && (
+                              <span className="absolute bottom-2 left-2 px-1.5 py-0.5 rounded bg-slate-900/80 backdrop-blur-sm text-[9px] font-mono text-slate-400 border border-slate-700">
+                                組 #{item.group_id}
+                              </span>
+                            )}
+
+                            {/* Status Tag */}
+                            {item.state !== 'candidate' && (
+                              <span className={`absolute bottom-2 right-2 px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                                item.state === 'queued' ? 'bg-rose-600 text-white' : 'bg-emerald-600 text-white'
+                              }`}>
+                                {item.state === 'queued' ? '待刪' : '已排除'}
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Card Info */}
+                          <div className="mt-3 space-y-1">
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="font-mono text-slate-200 truncate font-semibold" title={item.filename}>
+                                {item.filename}
+                              </span>
+                              <span className="text-slate-500 font-mono text-[11px]">
+                                {formatBytes(item.size_total)}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between text-[11px]">
+                              <span className="text-amber-400 font-medium">{getRuleBadgeText(item.rule)}</span>
+                              <span className="text-slate-500 font-mono truncate max-w-[130px]" title={item.reason}>
+                                {item.reason}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
       </section>
     </div>
   )
