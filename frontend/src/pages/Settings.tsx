@@ -7,8 +7,11 @@ import {
   Save, 
   CheckCircle2, 
   AlertCircle,
-  Layers,
-  Camera
+  Camera,
+  FileText,
+  Smartphone,
+  Laugh,
+  EyeOff
 } from 'lucide-react'
 import { api } from '../services/api'
 
@@ -83,7 +86,7 @@ export const Settings: React.FC = () => {
             <span>系統與偵測規則設定</span>
           </h2>
           <p className="text-slate-400 text-sm mt-1">
-            調整 AI 與規則引擎之偵測門檻、重複保留優先策略及安全刪除偏好
+            配置 AI 語義內容分析（截圖/文件/梗圖/誤拍）、重複比對門檻與安全刪除偏好
           </p>
         </div>
 
@@ -136,20 +139,185 @@ export const Settings: React.FC = () => {
         </label>
       </div>
 
-      {/* Section 1: 偵測規則開關與門檻 */}
+      {/* Section 1: AI 內容語義分類 (重點核心價值) */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6">
+        <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+          <div>
+            <h3 className="text-base font-semibold text-slate-100 flex items-center gap-2">
+              <Sparkles className="w-5 h-5 text-amber-400" />
+              <span>AI 內容語義分析分類（CLIP Zero-Shot 分類）</span>
+            </h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              依據相片實際圖像內容自動辨識分類，適合清理相簿中佔用空間之各類日常雜圖與廢片
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {/* AI 1: 螢幕截圖 */}
+          <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <Smartphone className="w-5 h-5 text-sky-400 shrink-0" />
+                <div>
+                  <span className="font-semibold text-slate-200 text-sm">螢幕截圖 (Screenshots)</span>
+                  <p className="text-xs text-slate-500">手機、電腦螢幕擷取畫面與聊天對話紀錄截圖</p>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={config.rule_screenshot_enabled ?? true}
+                onChange={(e) => handleChange('rule_screenshot_enabled', e.target.checked)}
+                className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500"
+              />
+            </div>
+
+            {config.rule_screenshot_enabled && (
+              <div className="space-y-1.5 pt-2 border-t border-slate-800/80">
+                <div className="flex justify-between text-xs">
+                  <span className="text-slate-400">AI 判定信心度門檻：</span>
+                  <span className="text-sky-400 font-mono font-bold">≥ {Math.round((config.screenshot_threshold ?? 0.7) * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="0.95"
+                  step="0.05"
+                  value={config.screenshot_threshold ?? 0.7}
+                  onChange={(e) => handleChange('screenshot_threshold', parseFloat(e.target.value))}
+                  className="w-full accent-sky-500 bg-slate-800 rounded-lg h-1.5 cursor-pointer"
+                />
+              </div>
+            )}
+          </div>
+
+          {/* AI 2: 文件/收據/白板 */}
+          <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <FileText className="w-5 h-5 text-emerald-400 shrink-0" />
+                <div>
+                  <span className="font-semibold text-slate-200 text-sm">文件 / 收據 / 發票 / 白板筆記 (Documents)</span>
+                  <p className="text-xs text-slate-500">拍攝的文件、報表、發票收據、名片或會議白板筆記</p>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={config.rule_document_enabled ?? true}
+                onChange={(e) => handleChange('rule_document_enabled', e.target.checked)}
+                className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500"
+              />
+            </div>
+
+            {config.rule_document_enabled && (
+              <div className="space-y-1.5 pt-2 border-t border-slate-800/80">
+                <div className="flex justify-between text-xs">
+                  <span className="text-slate-400">AI 判定信心度門檻：</span>
+                  <span className="text-emerald-400 font-mono font-bold">≥ {Math.round((config.document_threshold ?? 0.65) * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="0.95"
+                  step="0.05"
+                  value={config.document_threshold ?? 0.65}
+                  onChange={(e) => handleChange('document_threshold', parseFloat(e.target.value))}
+                  className="w-full accent-emerald-500 bg-slate-800 rounded-lg h-1.5 cursor-pointer"
+                />
+              </div>
+            )}
+          </div>
+
+          {/* AI 3: 梗圖/表情包/迷因 */}
+          <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <Laugh className="w-5 h-5 text-purple-400 shrink-0" />
+                <div>
+                  <span className="font-semibold text-slate-200 text-sm">網路梗圖 / 表情包 / 迷因 (Memes)</span>
+                  <p className="text-xs text-slate-500">網路下載的搞笑圖片、梗圖、社交貼圖與表情包</p>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={config.rule_meme_enabled ?? true}
+                onChange={(e) => handleChange('rule_meme_enabled', e.target.checked)}
+                className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500"
+              />
+            </div>
+
+            {config.rule_meme_enabled && (
+              <div className="space-y-1.5 pt-2 border-t border-slate-800/80">
+                <div className="flex justify-between text-xs">
+                  <span className="text-slate-400">AI 判定信心度門檻：</span>
+                  <span className="text-purple-400 font-mono font-bold">≥ {Math.round((config.meme_threshold ?? 0.75) * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="0.95"
+                  step="0.05"
+                  value={config.meme_threshold ?? 0.75}
+                  onChange={(e) => handleChange('meme_threshold', parseFloat(e.target.value))}
+                  className="w-full accent-purple-500 bg-slate-800 rounded-lg h-1.5 cursor-pointer"
+                />
+              </div>
+            )}
+          </div>
+
+          {/* AI 4: 誤拍廢片 */}
+          <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <EyeOff className="w-5 h-5 text-rose-400 shrink-0" />
+                <div>
+                  <span className="font-semibold text-slate-200 text-sm">誤拍 / 口袋 / 地板 / 手指遮擋 (Mistouches)</span>
+                  <p className="text-xs text-slate-500">誤觸快門拍到之純黑口袋、地板、大腿或手指遮擋畫面</p>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={config.rule_mistouch_enabled ?? true}
+                onChange={(e) => handleChange('rule_mistouch_enabled', e.target.checked)}
+                className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500"
+              />
+            </div>
+
+            {config.rule_mistouch_enabled && (
+              <div className="space-y-1.5 pt-2 border-t border-slate-800/80">
+                <div className="flex justify-between text-xs">
+                  <span className="text-slate-400">AI 判定信心度門檻：</span>
+                  <span className="text-rose-400 font-mono font-bold">≥ {Math.round((config.mistouch_threshold ?? 0.6) * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.4"
+                  max="0.9"
+                  step="0.05"
+                  value={config.mistouch_threshold ?? 0.6}
+                  onChange={(e) => handleChange('mistouch_threshold', parseFloat(e.target.value))}
+                  className="w-full accent-rose-500 bg-slate-800 rounded-lg h-1.5 cursor-pointer"
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Section 2: 傳統重複與質量規則 */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6">
         <div className="flex items-center justify-between border-b border-slate-800 pb-4">
           <div>
             <h3 className="text-base font-semibold text-slate-100 flex items-center gap-2">
               <Camera className="w-5 h-5 text-sky-400" />
-              <span>相片與影片偵測規則（Detection Rules）</span>
+              <span>傳統特徵與質量缺陷規則</span>
             </h3>
-            <p className="text-xs text-slate-500 mt-0.5">控制各類重複與缺陷檢查之開關與靈敏度門檻</p>
+            <p className="text-xs text-slate-500 mt-0.5">完全重複 Hash 比對、近似圖片、模糊與曝光不良檢查</p>
           </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* Rule 1: 完全重複 */}
+          {/* 完全重複 */}
           <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
@@ -165,7 +333,7 @@ export const Settings: React.FC = () => {
             </div>
           </div>
 
-          {/* Rule 2: 近似重複 */}
+          {/* 近似重複 */}
           <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
@@ -195,15 +363,11 @@ export const Settings: React.FC = () => {
                   onChange={(e) => handleChange('phash_threshold', parseInt(e.target.value))}
                   className="w-full accent-sky-500 bg-slate-800 rounded-lg h-1.5 cursor-pointer"
                 />
-                <div className="flex justify-between text-[10px] text-slate-600">
-                  <span>嚴格 (較少候選)</span>
-                  <span>寬鬆 (較多候選)</span>
-                </div>
               </div>
             )}
           </div>
 
-          {/* Rule 3: 模糊相片 */}
+          {/* 模糊相片 */}
           <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
@@ -233,16 +397,11 @@ export const Settings: React.FC = () => {
                   onChange={(e) => handleChange('blur_threshold', parseFloat(e.target.value))}
                   className="w-full accent-amber-500 bg-slate-800 rounded-lg h-1.5 cursor-pointer"
                 />
-                <div className="flex justify-between text-[10px] text-slate-600">
-                  <span>僅抓極度模糊 (30)</span>
-                  <span>標準 (100)</span>
-                  <span>輕微手震亦納入 (250)</span>
-                </div>
               </div>
             )}
           </div>
 
-          {/* Rule 4: 過暗與過曝 */}
+          {/* 曝光不良 */}
           <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
@@ -285,80 +444,6 @@ export const Settings: React.FC = () => {
                 </div>
               </div>
             )}
-          </div>
-
-          {/* Rule 5: 連拍多餘 */}
-          <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="space-y-0.5">
-                <span className="font-semibold text-slate-200 text-sm">連拍多餘相片 (Burst Photos)</span>
-                <p className="text-xs text-slate-500">時間差極短且畫面高度相似之連續拍攝，組內自動保留最清晰者</p>
-              </div>
-              <input
-                type="checkbox"
-                checked={config.rule_burst_enabled ?? true}
-                onChange={(e) => handleChange('rule_burst_enabled', e.target.checked)}
-                className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500"
-              />
-            </div>
-            {config.rule_burst_enabled && (
-              <div className="flex items-center justify-between text-xs pt-2 border-t border-slate-800/80">
-                <span className="text-slate-400">判定時間窗口：</span>
-                <span className="font-mono text-slate-200">{config.burst_time_window_seconds ?? 2.0} 秒以內</span>
-              </div>
-            )}
-          </div>
-
-          {/* Rule 6: 影片大小檢查 */}
-          <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="space-y-0.5">
-                <span className="font-semibold text-slate-200 text-sm">影片相同大小檢查 (Video Check)</span>
-                <p className="text-xs text-slate-500">依據檔案大小預篩，並以 Hash 確認是否為相同影片副本</p>
-              </div>
-              <input
-                type="checkbox"
-                checked={config.rule_video_same_size_enabled ?? true}
-                onChange={(e) => handleChange('rule_video_same_size_enabled', e.target.checked)}
-                className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500"
-              />
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Section 2: 重複組保留優先偏好 */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6">
-        <div className="border-b border-slate-800 pb-4">
-          <h3 className="text-base font-semibold text-slate-100 flex items-center gap-2">
-            <Layers className="w-5 h-5 text-emerald-400" />
-            <span>重複組保留優先決策（Keeper Strategy）</span>
-          </h3>
-          <p className="text-xs text-slate-500 mt-0.5">當多張相片完全重複或近似時，系統自動判定「建議保留」之排序依據</p>
-        </div>
-
-        <div className="space-y-4 text-xs">
-          <div className="flex items-center justify-between p-4 bg-slate-950/60 rounded-xl border border-slate-800">
-            <div>
-              <div className="font-semibold text-slate-200">跨路徑全庫重複比對</div>
-              <div className="text-slate-500 mt-0.5">開啟時比對所有已加入之相片目錄；關閉時僅在同一個目錄內比對</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={config.cross_path_duplicates ?? true}
-              onChange={(e) => handleChange('cross_path_duplicates', e.target.checked)}
-              className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500"
-            />
-          </div>
-
-          <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2">
-            <div className="font-semibold text-slate-200">系統內建自動保留仲裁優先級：</div>
-            <ol className="list-decimal list-inside space-y-1 text-slate-400 font-mono">
-              <li><strong>路徑優先順序</strong>（依據 Library 頁面中已登錄路徑之排序，最上方者最優先）</li>
-              <li><strong>影像解析度最高</strong>（寬 × 高 乘積最大者優先保留）</li>
-              <li><strong>實體檔案最大</strong>（保留細節更豐富之檔案）</li>
-              <li><strong>最舊拍攝時間</strong>（最早建立或拍攝之原始版本）</li>
-            </ol>
           </div>
         </div>
       </div>
@@ -423,29 +508,6 @@ export const Settings: React.FC = () => {
             <p className="mt-2 text-slate-400 leading-relaxed">
               直接從磁碟清除檔案，不可復原。執行時需在對話框額外輸入二次確認字串。
             </p>
-          </div>
-        </div>
-
-        {/* Locked Iron Rules status */}
-        <div className="p-4 bg-slate-950/80 rounded-xl border border-slate-800 text-xs space-y-2">
-          <div className="font-semibold text-slate-300">強制啟用的系統安全鐵則：</div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-slate-400">
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>「保留最後一張」防呆保護（任何重複組不得全滅）</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>配對完整性保護（Live Photo 與 RAW+JPG 同進同出）</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>Review 審核操作僅變更資料庫狀態，絕不刪檔</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>全本地離線運作，綁定 127.0.0.1</span>
-            </div>
           </div>
         </div>
       </div>

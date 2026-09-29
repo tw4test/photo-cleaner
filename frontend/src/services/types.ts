@@ -18,11 +18,14 @@ export interface DashboardStats {
   }
   candidates: {
     total: number
+    screenshot: number
+    document: number
+    meme: number
+    mistouch: number
     exact_dup: number
     near_dup: number
     blur: number
     exposure: number
-    burst: number
     releasable_size_bytes: number
   }
   history: {

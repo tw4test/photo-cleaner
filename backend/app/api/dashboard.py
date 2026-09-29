@@ -18,15 +18,19 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)) -> Dict[str, A
     video_count = await db.scalar(select(func.count(Asset.id)).where(Asset.media_type == MediaType.VIDEO, Asset.status != "deleted")) or 0
     total_size = await db.scalar(select(func.sum(Asset.size_total)).where(Asset.status != "deleted")) or 0
 
-    # 2. 候選統計
+    # 2. 候選統計 (包含 AI 語義分類與傳統規則)
     candidates_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.state == CandidateState.CANDIDATE)) or 0
+    screenshot_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "screenshot", Candidate.state == CandidateState.CANDIDATE)) or 0
+    document_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "document", Candidate.state == CandidateState.CANDIDATE)) or 0
+    meme_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "meme", Candidate.state == CandidateState.CANDIDATE)) or 0
+    mistouch_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "mistouch", Candidate.state == CandidateState.CANDIDATE)) or 0
+
     exact_dup_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "exact_dup", Candidate.state == CandidateState.CANDIDATE)) or 0
     near_dup_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "near_dup", Candidate.state == CandidateState.CANDIDATE)) or 0
     blur_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "blur", Candidate.state == CandidateState.CANDIDATE)) or 0
     exposure_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule.in_(["over_exposure", "under_exposure"]), Candidate.state == CandidateState.CANDIDATE)) or 0
-    burst_count = await db.scalar(select(func.count(Candidate.id)).where(Candidate.rule == "burst", Candidate.state == CandidateState.CANDIDATE)) or 0
 
-    # 可釋放容量 (只計算非 Keeper 且處於 candidate 或 queued 的資產總容量)
+    # 可釋放容量
     releasable_size_query = (
         select(func.sum(Asset.size_total))
         .join(Candidate, Candidate.asset_id == Asset.id)
@@ -53,11 +57,14 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)) -> Dict[str, A
         },
         "candidates": {
             "total": candidates_count,
+            "screenshot": screenshot_count,
+            "document": document_count,
+            "meme": meme_count,
+            "mistouch": mistouch_count,
             "exact_dup": exact_dup_count,
             "near_dup": near_dup_count,
             "blur": blur_count,
             "exposure": exposure_count,
-            "burst": burst_count,
             "releasable_size_bytes": releasable_size,
         },
         "history": {

@@ -25,6 +25,8 @@ class CandidateRule(str, Enum):
     OVER_EXPOSURE = "over_exposure"
     UNDER_EXPOSURE = "under_exposure"
     SCREENSHOT = "screenshot"
+    DOCUMENT = "document"
+    MEME = "meme"
     MISTOUCH = "mistouch"
     VIDEO_SAME_SIZE = "video_same_size"
     VIDEO_TINY = "video_tiny"

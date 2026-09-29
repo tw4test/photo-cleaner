@@ -9,19 +9,28 @@ from app.models.schema import Asset, File, Feature, Candidate, Group, Root, Sett
 from app.models.enums import CandidateRule, CandidateState, GroupType
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    # 規則開關
     "rule_exact_dup_enabled": True,
     "rule_near_dup_enabled": True,
     "rule_burst_enabled": True,
     "rule_blur_enabled": True,
     "rule_exposure_enabled": True,
-    "rule_screenshot_enabled": False,
-    "rule_mistouch_enabled": True,
+    "rule_screenshot_enabled": True,     # AI 截圖辨識 (預設開啟)
+    "rule_document_enabled": True,       # AI 文件/收據辨識 (預設開啟)
+    "rule_meme_enabled": True,           # AI 梗圖/迷因辨識 (預設開啟)
+    "rule_mistouch_enabled": True,       # AI 誤拍/廢片辨識 (預設開啟)
     "rule_video_same_size_enabled": True,
     "rule_video_tiny_enabled": False,
+
+    # 門檻參數
     "phash_threshold": 6,
     "blur_threshold": 100.0,
     "under_exposure_threshold": 30.0,
     "over_exposure_threshold": 225.0,
+    "screenshot_threshold": 0.70,        # 截圖信心度門檻 (0.0~1.0)
+    "document_threshold": 0.65,          # 文件/收據信心度門檻 (0.0~1.0)
+    "meme_threshold": 0.75,              # 梗圖迷因信心度門檻 (0.0~1.0)
+    "mistouch_threshold": 0.60,          # 誤拍廢片信心度門檻 (0.0~1.0)
     "burst_time_window_seconds": 2.0,
     "burst_similarity_threshold": 0.85,
     "video_tiny_threshold_kb": 100,
@@ -35,6 +44,7 @@ class RulesEngine:
     - 近似重複 (Near Duplicate)
     - 模糊相片 (Blur)
     - 過曝 / 過暗 (Exposure)
+    - AI 內容語義分析 (CLIP Zero-Shot: 螢幕截圖, 文件收據, 梗圖迷因, 誤拍廢片)
     - 影片大小重複 (Video Same Size)
     - 保留最後一張防呆保護 (Keeper Protection)
     """
@@ -69,6 +79,9 @@ class RulesEngine:
 
         # 3. 執行單張質量缺陷規則 (Blur & Exposure)
         self._evaluate_quality_rules(session, config)
+
+        # 4. 執行 AI 內容語義辨識 (CLIP Zero-Shot: 截圖/文件/梗圖/誤拍)
+        self._evaluate_ai_semantic_rules(session, config)
 
         session.commit()
 
@@ -262,12 +275,94 @@ class RulesEngine:
                     state=CandidateState.CANDIDATE.value
                 ))
 
+    def _evaluate_ai_semantic_rules(self, session: Session, config: Dict[str, Any]):
+        """評估 AI 內容語義分類：螢幕截圖、文件收據、梗圖迷因、誤拍廢片"""
+        screenshot_enabled = config.get("rule_screenshot_enabled", True)
+        document_enabled = config.get("rule_document_enabled", True)
+        meme_enabled = config.get("rule_meme_enabled", True)
+        mistouch_enabled = config.get("rule_mistouch_enabled", True)
+
+        screenshot_th = float(config.get("screenshot_threshold", 0.70))
+        document_th = float(config.get("document_threshold", 0.65))
+        meme_th = float(config.get("meme_threshold", 0.75))
+        mistouch_th = float(config.get("mistouch_threshold", 0.60))
+
+        features = (
+            session.query(Feature, Asset)
+            .join(Asset, Feature.asset_id == Asset.id)
+            .filter(Asset.status != "deleted", Feature.zs_scores.isnot(None))
+            .all()
+        )
+
+        for feat, asset in features:
+            zs = feat.zs_scores or {}
+
+            # 1. 螢幕截圖檢查
+            for key in ["screenshot", "螢幕截圖", "截圖"]:
+                if key in zs and screenshot_enabled:
+                    score = float(zs[key])
+                    if score >= screenshot_th:
+                        session.add(Candidate(
+                            asset_id=asset.id,
+                            rule=CandidateRule.SCREENSHOT.value,
+                            reason=f"AI 識別為螢幕截圖（信心度 {int(score * 100)}% ≥ 門檻 {int(screenshot_th * 100)}%）",
+                            score=score,
+                            group_id=None,
+                            is_keeper=False,
+                            state=CandidateState.CANDIDATE.value
+                        ))
+                        break
+
+            # 2. 文件 / 收據 / 白板筆記檢查
+            for key in ["document", "文件", "收據", "發票"]:
+                if key in zs and document_enabled:
+                    score = float(zs[key])
+                    if score >= document_th:
+                        session.add(Candidate(
+                            asset_id=asset.id,
+                            rule=CandidateRule.DOCUMENT.value,
+                            reason=f"AI 識別為文件/收據/筆記（信心度 {int(score * 100)}% ≥ 門檻 {int(document_th * 100)}%）",
+                            score=score,
+                            group_id=None,
+                            is_keeper=False,
+                            state=CandidateState.CANDIDATE.value
+                        ))
+                        break
+
+            # 3. 梗圖 / 表情包 / 迷因檢查
+            for key in ["meme", "梗圖", "迷因", "表情包"]:
+                if key in zs and meme_enabled:
+                    score = float(zs[key])
+                    if score >= meme_th:
+                        session.add(Candidate(
+                            asset_id=asset.id,
+                            rule=CandidateRule.MEME.value,
+                            reason=f"AI 識別為網路梗圖/表情包（信心度 {int(score * 100)}% ≥ 門檻 {int(meme_th * 100)}%）",
+                            score=score,
+                            group_id=None,
+                            is_keeper=False,
+                            state=CandidateState.CANDIDATE.value
+                        ))
+                        break
+
+            # 4. 誤拍 / 口袋 / 地板檢查
+            for key in ["mistouch", "誤拍", "廢片"]:
+                if key in zs and mistouch_enabled:
+                    score = float(zs[key])
+                    if score >= mistouch_th:
+                        session.add(Candidate(
+                            asset_id=asset.id,
+                            rule=CandidateRule.MISTOUCH.value,
+                            reason=f"AI 識別為誤拍/口袋黑畫面（信心度 {int(score * 100)}% ≥ 門檻 {int(mistouch_th * 100)}%）",
+                            score=score,
+                            group_id=None,
+                            is_keeper=False,
+                            state=CandidateState.CANDIDATE.value
+                        ))
+                        break
+
     def ensure_keeper_protection(self, session: Session, candidate_ids_to_queue: List[int]) -> List[int]:
-        """
-        【鐵則 3：保留最後一張保護】
-        若用戶嘗試將同一個重複組內的「所有」資產都標記為待刪/刪除，
-        系統強制攔截並保留原先的 Keeper 不予加入待刪。
-        """
+        """【鐵則 3：保留最後一張保護】"""
         candidates = session.query(Candidate).filter(Candidate.id.in_(candidate_ids_to_queue)).all()
         safe_candidate_ids = []
         for c in candidates:

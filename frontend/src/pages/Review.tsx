@@ -6,7 +6,15 @@ import {
   ShieldAlert, 
   Check, 
   RefreshCw,
-  Sparkles
+  Sparkles,
+  Smartphone,
+  FileText,
+  Laugh,
+  EyeOff,
+  Copy,
+  Layers,
+  Camera,
+  Sun
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../services/api'
@@ -22,16 +30,27 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`
 }
 
-function getRuleBadgeText(rule: string): string {
+function getRuleBadge(rule: string) {
   switch (rule) {
-    case 'exact_dup': return '完全重複'
-    case 'near_dup': return '近似重複'
-    case 'blur': return '模糊相片'
-    case 'over_exposure': return '相片過曝'
-    case 'under_exposure': return '相片過暗'
-    case 'burst': return '連拍多餘'
-    case 'screenshot': return '螢幕截圖'
-    default: return rule
+    case 'screenshot':
+      return { label: '螢幕截圖', color: 'bg-sky-500/20 text-sky-400 border-sky-500/30', icon: Smartphone }
+    case 'document':
+      return { label: '文件/收據', color: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30', icon: FileText }
+    case 'meme':
+      return { label: '梗圖迷因', color: 'bg-purple-500/20 text-purple-400 border-purple-500/30', icon: Laugh }
+    case 'mistouch':
+      return { label: '誤拍廢片', color: 'bg-rose-500/20 text-rose-400 border-rose-500/30', icon: EyeOff }
+    case 'exact_dup':
+      return { label: '完全重複', color: 'bg-amber-500/20 text-amber-400 border-amber-500/30', icon: Copy }
+    case 'near_dup':
+      return { label: '近似重複', color: 'bg-indigo-500/20 text-indigo-400 border-indigo-500/30', icon: Layers }
+    case 'blur':
+      return { label: '模糊相片', color: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30', icon: Camera }
+    case 'over_exposure':
+    case 'under_exposure':
+      return { label: '曝光不良', color: 'bg-orange-500/20 text-orange-400 border-orange-500/30', icon: Sun }
+    default:
+      return { label: rule, color: 'bg-slate-800 text-slate-300 border-slate-700', icon: Sparkles }
   }
 }
 
@@ -71,7 +90,7 @@ export const Review: React.FC = () => {
   const rowVirtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 300,
+    estimateSize: () => 310,
     overscan: 3,
   })
 
@@ -100,6 +119,20 @@ export const Review: React.FC = () => {
     }
   }
 
+  const categories = [
+    { id: 'all', label: '全部候選', icon: Sparkles },
+    // AI 語義分類 (核心亮點)
+    { id: 'screenshot', label: '螢幕截圖', icon: Smartphone, tag: 'AI' },
+    { id: 'document', label: '文件 / 收據', icon: FileText, tag: 'AI' },
+    { id: 'meme', label: '梗圖 / 迷因', icon: Laugh, tag: 'AI' },
+    { id: 'mistouch', label: '誤拍 / 廢片', icon: EyeOff, tag: 'AI' },
+    // 傳統特徵分類
+    { id: 'exact_dup', label: '完全重複', icon: Copy },
+    { id: 'near_dup', label: '近似重複', icon: Layers },
+    { id: 'blur', label: '模糊相片', icon: Camera },
+    { id: 'exposure', label: '曝光不良', icon: Sun },
+  ]
+
   return (
     <div className="flex-1 flex overflow-hidden">
       {/* Left Filter Sidebar */}
@@ -107,28 +140,33 @@ export const Review: React.FC = () => {
         <div>
           <h3 className="font-semibold text-slate-200 text-sm flex items-center gap-2">
             <Filter className="w-4 h-4 text-sky-400" />
-            <span>候選分類篩選</span>
+            <span>內容與規則篩選</span>
           </h3>
-          <div className="mt-3 space-y-1.5">
-            {[
-              { id: 'all', label: '全部候選' },
-              { id: 'exact_dup', label: '完全重複' },
-              { id: 'near_dup', label: '近似重複' },
-              { id: 'blur', label: '模糊相片' },
-              { id: 'exposure', label: '過暗 / 過曝' },
-            ].map(cat => (
-              <button
-                key={cat.id}
-                onClick={() => setActiveCategory(cat.id)}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors ${
-                  activeCategory === cat.id
-                    ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
-                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
-                }`}
-              >
-                <span>{cat.label}</span>
-              </button>
-            ))}
+          <div className="mt-3 space-y-1">
+            {categories.map(cat => {
+              const Icon = cat.icon
+              return (
+                <button
+                  key={cat.id}
+                  onClick={() => setActiveCategory(cat.id)}
+                  className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-medium transition-all ${
+                    activeCategory === cat.id
+                      ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30 font-semibold'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
+                  }`}
+                >
+                  <div className="flex items-center gap-2.5">
+                    <Icon className="w-4 h-4" />
+                    <span>{cat.label}</span>
+                  </div>
+                  {cat.tag && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30 font-mono font-bold">
+                      {cat.tag}
+                    </span>
+                  )}
+                </button>
+              )
+            })}
           </div>
         </div>
 
@@ -285,6 +323,9 @@ export const Review: React.FC = () => {
                   >
                     {rowItems.map((item) => {
                       const isSelected = selectedIds.has(item.id)
+                      const badge = getRuleBadge(item.rule)
+                      const BadgeIcon = badge.icon
+
                       return (
                         <div
                           key={item.id}
@@ -348,8 +389,12 @@ export const Review: React.FC = () => {
                                 {formatBytes(item.size_total)}
                               </span>
                             </div>
+
                             <div className="flex items-center justify-between text-[11px]">
-                              <span className="text-amber-400 font-medium">{getRuleBadgeText(item.rule)}</span>
+                              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[10px] font-medium ${badge.color}`}>
+                                <BadgeIcon className="w-3 h-3" />
+                                <span>{badge.label}</span>
+                              </span>
                               <span className="text-slate-500 font-mono truncate max-w-[130px]" title={item.reason}>
                                 {item.reason}
                               </span>

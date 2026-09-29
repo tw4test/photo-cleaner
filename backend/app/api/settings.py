@@ -12,33 +12,42 @@ from app.services.rules_engine import rules_engine
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    # 規則開關
+    # 基礎規則開關
     "rule_exact_dup_enabled": True,
     "rule_near_dup_enabled": True,
     "rule_burst_enabled": True,
     "rule_blur_enabled": True,
     "rule_exposure_enabled": True,
-    "rule_screenshot_enabled": False,
-    "rule_mistouch_enabled": True,
     "rule_video_same_size_enabled": True,
     "rule_video_tiny_enabled": False,
 
-    # 門檻參數
-    "phash_threshold": 6,                    # pHash 漢明距離門檻 (0-20, 越小越嚴格)
-    "blur_threshold": 100.0,                 # Laplacian 方差模糊門檻 (低於視為模糊)
-    "under_exposure_threshold": 30.0,        # 過暗亮度門檻 (0-255)
-    "over_exposure_threshold": 225.0,        # 過曝亮度門檻 (0-255)
-    "burst_time_window_seconds": 2.0,        # 連拍時間差判定 (秒)
-    "burst_similarity_threshold": 0.85,      # 連拍相似度門檻
+    # AI 內容語義分類開關 (CLIP Zero-Shot)
+    "rule_screenshot_enabled": True,         # 螢幕截圖辨識
+    "rule_document_enabled": True,           # 文件/收據/白板辨識
+    "rule_meme_enabled": True,               # 網路梗圖/表情包辨識
+    "rule_mistouch_enabled": True,           # 誤拍/口袋/地板廢片辨識
+
+    # AI 信心度門檻 (0.0 ~ 1.0)
+    "screenshot_threshold": 0.70,            # 截圖信心度門檻
+    "document_threshold": 0.65,              # 文件收據信心度門檻
+    "meme_threshold": 0.75,                  # 梗圖迷因信心度門檻
+    "mistouch_threshold": 0.60,              # 誤拍廢片信心度門檻
+
+    # 傳統特徵門檻
+    "phash_threshold": 6,                    # pHash 漢明距離門檻 (0-20)
+    "blur_threshold": 100.0,                 # Laplacian 方差模糊門檻
+    "under_exposure_threshold": 30.0,        # 過暗亮度門檻
+    "over_exposure_threshold": 225.0,        # 過曝亮度門檻
+    "burst_time_window_seconds": 2.0,        # 連拍時間差 (秒)
     "video_tiny_threshold_kb": 100,          # 極小影片門檻 (KB)
 
     # 重複保留策略
-    "keeper_strategy": "priority,resolution,size,oldest",  # 優先順序: 路徑優先 > 解析度 > 檔案大小 > 最舊
-    "cross_path_duplicates": True,           # 跨路徑比對重複
+    "keeper_strategy": "priority,resolution,size,oldest",
+    "cross_path_duplicates": True,
 
     # 刪除與安全
-    "deletion_mode": "trash",                # "trash" (資源回收筒) | "quarantine" (隔離) | "permanent" (永久)
-    "auto_evaluate_on_save": True,           # 儲存設定後自動重新評估規則
+    "deletion_mode": "trash",
+    "auto_evaluate_on_save": True,
 }
 
 class SettingsUpdate(BaseModel):
@@ -75,7 +84,6 @@ async def update_settings(
                 session.add(Setting(key=key, value=str_val))
         session.commit()
 
-        # 自動重新評估規則
         if payload.re_evaluate:
             rules_engine.evaluate_all_rules(session)
 

@@ -8,7 +8,11 @@ import {
   ArrowRight, 
   CheckCircle2, 
   AlertCircle,
-  RefreshCw
+  RefreshCw,
+  Smartphone,
+  FileText,
+  Laugh,
+  EyeOff
 } from 'lucide-react'
 import { api } from '../services/api'
 import { DashboardStats } from '../services/types'
@@ -47,7 +51,7 @@ export const Dashboard: React.FC = () => {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-2xl font-bold text-slate-100">首頁總覽</h2>
-          <p className="text-slate-400 text-sm mt-1">本地相片庫分析與瘦身建議統計</p>
+          <p className="text-slate-400 text-sm mt-1">本地相片庫 AI 語義內容分析與清理建議</p>
         </div>
         <button
           onClick={loadStats}
@@ -62,7 +66,7 @@ export const Dashboard: React.FC = () => {
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 relative overflow-hidden">
           <div className="flex items-center justify-between">
-            <span className="text-slate-400 text-sm font-medium">總掃描資產</span>
+            <span className="text-slate-400 text-sm font-medium">總相片庫資產</span>
             <Images className="w-5 h-5 text-sky-400" />
           </div>
           <div className="mt-4">
@@ -85,7 +89,7 @@ export const Dashboard: React.FC = () => {
               {stats?.candidates.total ?? 0}
             </div>
             <div className="text-xs text-slate-500 mt-1">
-              完全重複 {stats?.candidates.exact_dup ?? 0} ｜ 模糊 {stats?.candidates.blur ?? 0} ｜ 曝光異常 {stats?.candidates.exposure ?? 0}
+              AI 語義雜圖 {(stats?.candidates.screenshot ?? 0) + (stats?.candidates.document ?? 0) + (stats?.candidates.meme ?? 0) + (stats?.candidates.mistouch ?? 0)} ｜ 重複/模糊 {(stats?.candidates.exact_dup ?? 0) + (stats?.candidates.near_dup ?? 0) + (stats?.candidates.blur ?? 0)}
             </div>
           </div>
         </div>
@@ -100,7 +104,7 @@ export const Dashboard: React.FC = () => {
               {formatBytes(stats?.candidates.releasable_size_bytes ?? 0)}
             </div>
             <div className="text-xs text-slate-500 mt-1">
-              總資料庫佔比 {stats && stats.assets.total_size_bytes > 0 ? ((stats.candidates.releasable_size_bytes / stats.assets.total_size_bytes) * 100).toFixed(1) : 0}%
+              佔總容量 {stats && stats.assets.total_size_bytes > 0 ? ((stats.candidates.releasable_size_bytes / stats.assets.total_size_bytes) * 100).toFixed(1) : 0}%
             </div>
           </div>
         </div>
@@ -121,28 +125,76 @@ export const Dashboard: React.FC = () => {
         </div>
       </div>
 
-      {/* Quick Action Banner */}
-      <div className="bg-gradient-to-r from-sky-950/40 via-slate-900 to-slate-900 border border-sky-800/40 rounded-2xl p-6 flex items-center justify-between">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2 text-sky-400 font-semibold text-base">
-            <CheckCircle2 className="w-5 h-5" />
-            <span>
-              {(stats?.assets.total ?? 0) === 0 ? '目前尚未掃描任何相片資產' : `已完成 ${stats?.assets.total} 張相片分析`}
-            </span>
-          </div>
-          <p className="text-slate-400 text-sm">
-            {(stats?.assets.total ?? 0) === 0
-              ? '請先至「資料庫掃描」頁面加入本機相片資料夾並執行掃描。'
-              : `偵測到 ${stats?.candidates.total} 個候選瘦身項目，點擊前往審核工作台確認。`}
-          </p>
+      {/* AI Semantic Categories Breakdown Cards */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="font-semibold text-slate-100 text-base flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-amber-400" />
+            <span>AI 內容語義分類候選分佈（CLIP 智能識別）</span>
+          </h3>
+          <Link to="/review" className="text-xs text-sky-400 hover:underline flex items-center gap-1">
+            <span>前往審核工作台</span>
+            <ArrowRight className="w-3 h-3" />
+          </Link>
         </div>
-        <Link
-          to={(stats?.assets.total ?? 0) === 0 ? "/library" : "/review"}
-          className="flex items-center gap-2 px-5 py-2.5 bg-sky-600 hover:bg-sky-500 text-white rounded-xl font-medium transition-all shadow-lg shadow-sky-600/20"
-        >
-          <span>{(stats?.assets.total ?? 0) === 0 ? "前往設定路徑" : "前往審核工作台"}</span>
-          <ArrowRight className="w-4 h-4" />
-        </Link>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <Link
+            to="/review"
+            className="p-4 bg-slate-950/70 border border-slate-800 hover:border-sky-500/50 rounded-xl space-y-2 transition-colors group"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400 group-hover:text-slate-200">螢幕截圖</span>
+              <Smartphone className="w-4 h-4 text-sky-400" />
+            </div>
+            <div className="text-2xl font-bold font-mono text-slate-100">
+              {stats?.candidates.screenshot ?? 0}
+            </div>
+            <div className="text-[10px] text-slate-500">聊天紀錄 / 應用擷取</div>
+          </Link>
+
+          <Link
+            to="/review"
+            className="p-4 bg-slate-950/70 border border-slate-800 hover:border-emerald-500/50 rounded-xl space-y-2 transition-colors group"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400 group-hover:text-slate-200">文件 / 收據</span>
+              <FileText className="w-4 h-4 text-emerald-400" />
+            </div>
+            <div className="text-2xl font-bold font-mono text-slate-100">
+              {stats?.candidates.document ?? 0}
+            </div>
+            <div className="text-[10px] text-slate-500">發票 / 報表 / 白板筆記</div>
+          </Link>
+
+          <Link
+            to="/review"
+            className="p-4 bg-slate-950/70 border border-slate-800 hover:border-purple-500/50 rounded-xl space-y-2 transition-colors group"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400 group-hover:text-slate-200">梗圖 / 迷因</span>
+              <Laugh className="w-4 h-4 text-purple-400" />
+            </div>
+            <div className="text-2xl font-bold font-mono text-slate-100">
+              {stats?.candidates.meme ?? 0}
+            </div>
+            <div className="text-[10px] text-slate-500">網路貼圖 / 搞笑圖片</div>
+          </Link>
+
+          <Link
+            to="/review"
+            className="p-4 bg-slate-950/70 border border-slate-800 hover:border-rose-500/50 rounded-xl space-y-2 transition-colors group"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400 group-hover:text-slate-200">誤拍 / 廢片</span>
+              <EyeOff className="w-4 h-4 text-rose-400" />
+            </div>
+            <div className="text-2xl font-bold font-mono text-slate-100">
+              {stats?.candidates.mistouch ?? 0}
+            </div>
+            <div className="text-[10px] text-slate-500">口袋純黑 / 地板 / 手指遮擋</div>
+          </Link>
+        </div>
       </div>
 
       {/* System Status */}
