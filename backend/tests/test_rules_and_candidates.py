@@ -7,11 +7,13 @@ from PIL import Image
 
 from app.main import app
 from app.core.database import init_db, SyncSessionLocal
-from app.models.schema import Root, Asset, File, Feature, Candidate, Group
+from app.models.schema import Root, Asset, File, Feature, ClipFeature, Candidate, Group
 from app.services.scanner import scan_directory
 from app.services.pairing import pairing_engine
 from app.services.rules_engine import rules_engine
 from app.api.scan import run_sync_scan
+from app.services.hash_stage import run_hash_stage
+from app.services.basic_stage import run_basic_stage
 
 client = TestClient(app)
 
@@ -36,8 +38,14 @@ def test_rules_engine_and_candidates():
         assert res.status_code == 200
         root_id = res.json()["id"]
 
-        # Run synchronous scan and evaluation
+        # Run synchronous scan
         run_sync_scan(root_id)
+
+        # In split architecture: run analysis stages and evaluate rules
+        with SyncSessionLocal() as session:
+            run_hash_stage(session)
+            run_basic_stage(session)
+            rules_engine.evaluate_all_rules(session)
 
         # Test Dashboard stats API
         dash_res = client.get("/api/dashboard/stats")

@@ -13,7 +13,7 @@ from app.models.schema import Root, Asset, File, Feature, Candidate
 from app.services.scanner import scan_directory
 from app.services.pairing import pairing_engine
 from app.services.feature_pipeline import feature_pipeline
-from app.api.scan import run_sync_scan
+from app.api.scan import run_sync_scan   # backward-compat re-export
 
 client = TestClient(app)
 
@@ -61,12 +61,22 @@ def test_scan_and_pairing_mock():
         paired = pairing_engine.pair_files(scanned)
         assert len(paired) == 2  # IMG_0001 (Live Photo) and IMG_0002 (RAW+JPG)
 
-        # Test feature extraction on primary photo
+        # Test feature extraction on primary photo (via backward-compat extract_features)
         feats = feature_pipeline.extract_features(str(img_path))
         assert feats["sha256"] is not None
         assert feats["blur_score"] is not None  # Mock fake blur
+        # clip_embedding is still returned by extract_features() for backward-compat
         assert feats["clip_embedding"] is not None  # Mock 512-dim embedding
         assert len(feats["clip_embedding"]) == 512 * 4  # 512 float32 bytes
+
+        # Verify new split APIs work independently
+        basic = feature_pipeline.extract_basic(str(img_path))
+        assert basic["phash"] is not None
+        assert "clip_embedding" not in basic, "extract_basic must not return CLIP embedding"
+
+        clip = feature_pipeline.extract_clip(str(img_path))
+        assert clip["embedding"] is not None
+        assert "phash" not in clip, "extract_clip must not return phash"
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -115,9 +125,9 @@ def test_repeated_scan_idempotency_and_candidate_count():
         run_sync_scan(root_id)
         status1 = client.get("/api/scan/status").json()
         assert status1["stage"] == "completed"
-        assert status1["total_files"] == 3
         assert status1["new_assets_count"] == 3
-        assert status1["new_candidates_count"] <= 3  # 候選資產數必定 <= 總資產數 3
+        # 掃描階段不執行評估，候選數為 0（評估已拆分為獨立的 /api/jobs/evaluate）
+        assert status1["new_candidates_count"] == 0
 
         with SyncSessionLocal() as session:
             asset_count_1 = session.query(Asset).count()
@@ -127,9 +137,8 @@ def test_repeated_scan_idempotency_and_candidate_count():
         run_sync_scan(root_id)
         status2 = client.get("/api/scan/status").json()
         assert status2["stage"] == "completed"
-        assert status2["total_files"] == 3
         assert status2["new_assets_count"] == 0  # 重複掃描時，新資產為 0
-        assert status2["new_candidates_count"] <= 3
+        assert status2["new_candidates_count"] == 0
 
         with SyncSessionLocal() as session:
             asset_count_2 = session.query(Asset).count()

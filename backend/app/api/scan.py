@@ -1,183 +1,89 @@
+"""
+掃描 API（向下相容層）。
+
+新的主要端點已移至 /api/jobs（app/api/jobs.py）。
+此模組保留 /api/scan/* 路由以維持向下相容，
+內部委託給新的 scan_job 服務。
+
+POST /api/scan/all       → 完整掃描（等同 POST /api/jobs/scan with mode=full）
+POST /api/scan/{root_id} → 指定目錄完整掃描
+GET  /api/scan/status    → 進度查詢（與 /api/jobs/status 共用 progress_tracker）
+GET  /api/scan/events    → SSE 進度推送
+POST /api/scan/cancel    → 取消
+
+注意：舊版 /api/scan/* 觸發的是「掃描+分析+評估」一體流程。
+      新版只做掃描，不觸發分析。若需要完整流程，請改用 /api/jobs/*。
+"""
+
 import json
 import asyncio
+import logging
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
-from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Optional
 
 from app.core.database import get_db, SyncSessionLocal
 from app.core.progress import progress_tracker
-from app.models.schema import Root, Asset, File, Feature, VideoInfo, Candidate
-from app.services.scanner import scan_directory
-from app.services.pairing import pairing_engine
-from app.services.thumbnail import thumbnail_service
-from app.services.feature_pipeline import feature_pipeline
-from app.services.rules_engine import rules_engine
+from app.models.schema import Root
+from app.services.scan_job import run_scan_job
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/scan", tags=["scan"])
 
-def run_sync_scan(root_id: Optional[int] = None):
-    """Background task to perform scanning, feature extraction, and candidate generation with live progress."""
-    progress_tracker.start_scan()
-    
+
+def _run_scan_bg(root_id: Optional[int], mode: str = "full"):
+    """內部背景掃描任務（scan only，不觸發分析）。"""
+    progress_tracker.start_scan(mode=mode)
     with SyncSessionLocal() as session:
         try:
-            if root_id is not None:
-                roots = [session.get(Root, root_id)]
-            else:
-                roots = session.query(Root).filter(Root.available == True).order_by(Root.priority.asc()).all()
-
-            # 1. 遍歷目錄統計檔案
-            all_scanned_files = []
-            for root in roots:
-                if not root:
-                    continue
-                files = list(scan_directory(root.path, root.recursive, root.exclude_patterns))
-                for f in files:
-                    f["root_id"] = root.id
-                all_scanned_files.extend(files)
-
-            total_discovered = len(all_scanned_files)
-            progress_tracker.set_discovered_total(total_discovered)
-
-            # 2. 配對
-            paired_assets = pairing_engine.pair_files(all_scanned_files)
-
-            # 3. 逐一處理特徵分析與縮圖
-            processed_files_count = 0
-            new_assets_count = 0
-
-            for idx, item in enumerate(paired_assets):
-                if progress_tracker.is_cancel_requested():
-                    break
-
-                primary_file = item["primary_file"]
-                paired_files = item["paired_files"]
-                root_id_for_asset = primary_file.get("root_id", roots[0].id if roots else 1)
-
-                # 檢查是否已存在
-                existing_asset = session.query(Asset).filter(Asset.primary_path == primary_file["path"]).first()
-                if existing_asset:
-                    processed_files_count += 1 + len(paired_files)
-                    progress_tracker.update_progress(
-                        processed=processed_files_count,
-                        current_file=primary_file["path"],
-                        new_assets=new_assets_count
-                    )
-                    continue
-
-                asset = Asset(
-                    root_id=root_id_for_asset,
-                    media_type=item["media_type"],
-                    primary_path=primary_file["path"],
-                    size_total=item["size_total"],
-                    paired_paths=[p["path"] for p in paired_files],
-                    status="analysed",
-                    created_at=datetime.utcnow()
-                )
-                session.add(asset)
-                session.flush()
-                new_assets_count += 1
-
-                # 寫入主檔案記錄
-                primary_record = File(
-                    asset_id=asset.id,
-                    path=primary_file["path"],
-                    size=primary_file["size"],
-                    mtime=primary_file["mtime"],
-                    format=primary_file["ext"].lstrip('.'),
-                    role="primary"
-                )
-                session.add(primary_record)
-
-                # 寫入附屬配對檔案記錄
-                for p in paired_files:
-                    pair_record = File(
-                        asset_id=asset.id,
-                        path=p["path"],
-                        size=p["size"],
-                        mtime=p["mtime"],
-                        format=p["ext"].lstrip('.'),
-                        role="pair"
-                    )
-                    session.add(pair_record)
-
-                # 生成縮圖快取
-                thumbnail_service.generate_thumbnail(primary_file["path"])
-
-                # 提取特徵 (包含 AI 語義分類)
-                feats = feature_pipeline.extract_features(
-                    primary_file["path"],
-                    is_raw=(item["media_type"] == "raw"),
-                    is_video=(item["media_type"] == "video")
-                )
-                primary_record.sha256 = feats["sha256"]
-
-                if item["media_type"] == "video":
-                    v_info = VideoInfo(
-                        asset_id=asset.id,
-                        duration=None,
-                        width=None,
-                        height=None,
-                        codec=None
-                    )
-                    session.add(v_info)
-                else:
-                    feat_record = Feature(
-                        asset_id=asset.id,
-                        phash=feats["phash"],
-                        blur_score=feats["blur_score"],
-                        brightness=feats["brightness"],
-                        width=feats["width"],
-                        height=feats["height"],
-                        taken_at=feats["taken_at"],
-                        exif=feats["exif"],
-                        clip_embedding=feats["clip_embedding"],
-                        zs_scores=feats["zs_scores"],
-                        decode_status=feats["decode_status"]
-                    )
-                    session.add(feat_record)
-
-                processed_files_count += 1 + len(paired_files)
-                progress_tracker.update_progress(
-                    processed=processed_files_count,
-                    current_file=primary_file["path"],
-                    new_assets=new_assets_count
-                )
-
-            for r in roots:
-                if r:
-                    r.last_scan_at = datetime.utcnow()
-            session.commit()
-
-            # 4. 執行規則引擎產出候選
-            progress_tracker.set_evaluating_rules()
-            rules_engine.evaluate_all_rules(session)
-
-            # 統計產出候選數 (計算不重複之待清理相片資產總數)
-            candidates_count = session.query(
-                func.count(func.distinct(Candidate.asset_id))
-            ).filter(Candidate.is_keeper == False).scalar() or 0
-
-            # 5. 完成廣播
-            progress_tracker.complete_scan(
-                new_assets=new_assets_count,
-                new_candidates=candidates_count
+            root_ids = [root_id] if root_id is not None else None
+            summary = run_scan_job(
+                session,
+                root_ids=root_ids,
+                mode=mode,
+                progress_tracker=progress_tracker,
             )
+            session.commit()
+            progress_tracker.complete_scan(
+                summary={
+                    "added": summary.added,
+                    "modified": summary.modified,
+                    "missing": summary.missing,
+                    "unchanged": summary.unchanged,
+                }
+            )
+        except InterruptedError:
+            session.rollback()
+            logger.info("掃描被取消")
         except Exception as e:
             session.rollback()
-            progress_tracker.fail_scan(str(e))
+            logger.error(f"掃描錯誤：{e}", exc_info=True)
+            progress_tracker.fail_job(str(e))
+
+
+# ─── 舊版相容的 run_sync_scan（供現有測試使用） ───────────────────────────────────
+
+def run_sync_scan(root_id: Optional[int] = None):
+    """
+    【向下相容】背景掃描任務。
+    新代碼請改用 /api/jobs/scan 端點或直接呼叫 run_scan_job()。
+    """
+    _run_scan_bg(root_id, mode="full")
+
+
+# ─── API 端點 ──────────────────────────────────────────────────────────────────
 
 @router.get("/status")
 async def get_scan_status():
-    """取得當前掃描進度狀態"""
+    """取得當前任務進度狀態（與 /api/jobs/status 共用）。"""
     return progress_tracker.get_state()
+
 
 @router.get("/events")
 async def scan_events(request: Request):
-    """Server-Sent Events (SSE) 即時推送掃描進度"""
+    """Server-Sent Events (SSE) 即時推送掃描進度。"""
     async def event_generator():
         async for state in progress_tracker.subscribe():
             if await request.is_disconnected():
@@ -191,35 +97,39 @@ async def scan_events(request: Request):
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
-        }
+        },
     )
+
 
 @router.post("/cancel")
 async def cancel_scan():
-    """取消當前正在進行的掃描任務"""
+    """取消當前正在進行的任務。"""
     progress_tracker.request_cancel()
-    return {"status": "ok", "message": "已發送取消掃描請求"}
+    return {"status": "ok", "message": "已發送取消請求"}
+
 
 @router.post("/all")
 async def trigger_scan_all(background_tasks: BackgroundTasks):
-    if progress_tracker.state.is_scanning:
-        raise HTTPException(status_code=400, detail="目前已有掃描任務進行中")
+    """完整掃描所有已設定的路徑（scan only）。"""
+    if progress_tracker.state.is_running:
+        raise HTTPException(status_code=400, detail="目前已有任務進行中")
+    background_tasks.add_task(_run_scan_bg, None, "full")
+    return {"status": "ok", "message": "已在背景啟動全庫掃描"}
 
-    background_tasks.add_task(run_sync_scan, None)
-    return {"status": "ok", "message": "已在背景啟動全庫掃描與規則分析"}
 
 @router.post("/{root_id}")
 async def trigger_scan(
-    root_id: int, 
-    background_tasks: BackgroundTasks, 
-    db: AsyncSession = Depends(get_db)
+    root_id: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
 ):
-    if progress_tracker.state.is_scanning:
-        raise HTTPException(status_code=400, detail="目前已有掃描任務進行中")
+    """掃描指定的路徑（scan only）。"""
+    if progress_tracker.state.is_running:
+        raise HTTPException(status_code=400, detail="目前已有任務進行中")
 
     root = await db.get(Root, root_id)
     if not root:
         raise HTTPException(status_code=404, detail="找不到指定的路徑")
 
-    background_tasks.add_task(run_sync_scan, root_id)
+    background_tasks.add_task(_run_scan_bg, root_id, "full")
     return {"status": "ok", "message": f"已在背景啟動目錄掃描：{root.path}"}

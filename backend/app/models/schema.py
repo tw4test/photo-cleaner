@@ -31,15 +31,18 @@ class Asset(Base):
     primary_path = Column(String, nullable=False, unique=True, index=True)
     size_total = Column(BigInteger, default=0, nullable=False)
     paired_paths = Column(JSON, default=list, nullable=False)
-    status = Column(String, default="unanalysed", nullable=False, index=True)  # unanalysed | analysed | candidate | queued | deleted | kept
+    status = Column(String, default="unanalysed", nullable=False, index=True)
+    # unanalysed | analysed | candidate | queued | deleted | kept | missing
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     root = relationship("Root", back_populates="assets")
     files = relationship("File", back_populates="asset", cascade="all, delete-orphan")
     features = relationship("Feature", back_populates="asset", uselist=False, cascade="all, delete-orphan")
+    clip_feature = relationship("ClipFeature", back_populates="asset", uselist=False, cascade="all, delete-orphan")
     video_info = relationship("VideoInfo", back_populates="asset", uselist=False, cascade="all, delete-orphan")
     candidates = relationship("Candidate", back_populates="asset", cascade="all, delete-orphan")
     actions = relationship("ActionLog", back_populates="asset")
+    analysis_failures = relationship("AnalysisFailure", back_populates="asset", cascade="all, delete-orphan")
 
 
 class File(Base):
@@ -53,11 +56,14 @@ class File(Base):
     sha256 = Column(String(64), nullable=True, index=True)
     format = Column(String(20), nullable=False)
     role = Column(String(20), default="primary", nullable=False)  # primary | pair
+    hash_state = Column(String(20), default="pending", nullable=False)
+    # pending | done | not_needed | error
 
     asset = relationship("Asset", back_populates="files")
 
 
 class Feature(Base):
+    """基本相片特徵（縮圖、模糊、pHash、EXIF 等），不含 CLIP 向量。"""
     __tablename__ = "features"
 
     asset_id = Column(Integer, ForeignKey("assets.id", ondelete="CASCADE"), primary_key=True)
@@ -68,11 +74,25 @@ class Feature(Base):
     height = Column(Integer, nullable=True)
     taken_at = Column(DateTime, nullable=True, index=True)
     exif = Column(JSON, default=dict, nullable=False)
-    clip_embedding = Column(LargeBinary, nullable=True)  # Stored as BLOB (512-dim float32)
-    zs_scores = Column(JSON, default=dict, nullable=False)
-    decode_status = Column(String(20), default="ok", nullable=False)  # ok | fallback | failed
+    decode_status = Column(String(20), default="ok", nullable=False)  # ok | fallback | error
+    analyzed_at = Column(DateTime, nullable=True)
 
     asset = relationship("Asset", back_populates="features")
+
+
+class ClipFeature(Base):
+    """CLIP 向量特徵，記錄模型版本以支援過期偵測。"""
+    __tablename__ = "clip_features"
+
+    asset_id = Column(Integer, ForeignKey("assets.id", ondelete="CASCADE"), primary_key=True)
+    model = Column(String(100), nullable=False)       # e.g. "ViT-B-16"
+    pretrained = Column(String(100), nullable=False)  # e.g. "openai"
+    dim = Column(Integer, nullable=False)             # e.g. 512
+    embedding = Column(LargeBinary, nullable=True)    # BLOB (dim * 4 bytes, float32)
+    zs = Column(JSON, default=dict, nullable=False)   # 零樣本機率 JSON
+    analyzed_at = Column(DateTime, nullable=True)
+
+    asset = relationship("Asset", back_populates="clip_feature")
 
 
 class VideoInfo(Base):
@@ -85,6 +105,19 @@ class VideoInfo(Base):
     codec = Column(String(50), nullable=True)
 
     asset = relationship("Asset", back_populates="video_info")
+
+
+class AnalysisFailure(Base):
+    """記錄各分析階段的失敗資訊，供重試與檢視使用。"""
+    __tablename__ = "analysis_failures"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    asset_id = Column(Integer, ForeignKey("assets.id", ondelete="CASCADE"), nullable=False, index=True)
+    stage = Column(String(20), nullable=False, index=True)  # hash | basic | clip | video
+    error_msg = Column(Text, nullable=True)
+    occurred_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    asset = relationship("Asset", back_populates="analysis_failures")
 
 
 class Group(Base):

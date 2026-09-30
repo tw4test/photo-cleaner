@@ -5,7 +5,7 @@ from sqlalchemy import select, and_
 import imagehash
 
 from app.core.config import settings
-from app.models.schema import Asset, File, Feature, Candidate, Group, Root, Setting
+from app.models.schema import Asset, File, Feature, ClipFeature, Candidate, Group, Root, Setting
 from app.models.enums import CandidateRule, CandidateState, GroupType
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -276,7 +276,12 @@ class RulesEngine:
                 ))
 
     def _evaluate_ai_semantic_rules(self, session: Session, config: Dict[str, Any]):
-        """評估 AI 內容語義分類：螢幕截圖、文件收據、梗圖迷因、誤拍廢片"""
+        """
+        評估 AI 內容語義分類：螢幕截圖、文件收據、梗圖迷因、誤拍廢片。
+
+        A-17：只使用與目前設定相同模型的 CLIP 向量；
+        若有資產的向量模型不符（過期），計數後記錄日誌，不混用。
+        """
         screenshot_enabled = config.get("rule_screenshot_enabled", True)
         document_enabled = config.get("rule_document_enabled", True)
         meme_enabled = config.get("rule_meme_enabled", True)
@@ -287,15 +292,54 @@ class RulesEngine:
         meme_th = float(config.get("meme_threshold", 0.75))
         mistouch_th = float(config.get("mistouch_threshold", 0.60))
 
-        features = (
-            session.query(Feature, Asset)
-            .join(Asset, Feature.asset_id == Asset.id)
-            .filter(Asset.status != "deleted", Feature.zs_scores.isnot(None))
+        # A-17: 取得目前設定的 CLIP 模型
+        current_clip_model = config.get("clip_model", "ViT-B-16")
+        current_clip_pretrained = config.get("clip_pretrained", "openai")
+
+        # 取得所有活躍資產的 ClipFeature（僅限目前模型，A-17）
+        clip_features = (
+            session.query(ClipFeature, Asset)
+            .join(Asset, ClipFeature.asset_id == Asset.id)
+            .filter(
+                Asset.status != "deleted",
+                ClipFeature.model == current_clip_model,
+                ClipFeature.pretrained == current_clip_pretrained,
+                ClipFeature.zs.isnot(None),
+            )
             .all()
         )
 
-        for feat, asset in features:
-            zs = feat.zs_scores or {}
+        # 計算過期（模型不符）的資產數量，提示用戶
+        stale_count = (
+            session.query(ClipFeature)
+            .join(Asset, ClipFeature.asset_id == Asset.id)
+            .filter(
+                Asset.status != "deleted",
+                (ClipFeature.model != current_clip_model) |
+                (ClipFeature.pretrained != current_clip_pretrained),
+            )
+            .count()
+        )
+        if stale_count > 0:
+            import logging
+            logging.getLogger(__name__).warning(
+                "A-17: 有 %d 個資產的 CLIP 向量使用舊模型（%s/%s → 目前設定 %s/%s），"
+                "評估時已排除這些資產。請執行「只重算 CLIP」後重新評估。",
+                stale_count,
+                "?", "?",
+                current_clip_model, current_clip_pretrained,
+            )
+
+        for clip_feat, asset in clip_features:
+            zs = {}
+            try:
+                raw_zs = clip_feat.zs
+                if isinstance(raw_zs, str):
+                    zs = json.loads(raw_zs)
+                elif isinstance(raw_zs, dict):
+                    zs = raw_zs
+            except Exception:
+                pass
 
             # 1. 螢幕截圖檢查
             for key in ["screenshot", "螢幕截圖", "截圖"]:

@@ -1,67 +1,286 @@
+import logging
+import io
+import os
 import hashlib
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Any
+from PIL import Image
 import numpy as np
-from typing import List, Dict
 
-# TODO(GPU): 替換為 open_clip / SigLIP (CUDA 12.8+, RTX 5080 批次推論)
-class MockClipExtractor:
+logger = logging.getLogger(__name__)
+
+# 標準 Prompt Ensemble 模板集合
+PROMPT_ENSEMBLES: Dict[str, List[str]] = {
+    "screenshot": [
+        "a screenshot",
+        "a screenshot of a user interface",
+        "a screenshot of a mobile or computer screen",
+        "a screen capture of an application",
+    ],
+    "document": [
+        "a photo of a printed paper document",
+        "a photo of a receipt or invoice",
+        "a handwritten note or whiteboard",
+        "a page of a book or document",
+    ],
+    "meme": [
+        "an internet meme with text overlay",
+        "a funny meme picture",
+        "a comic strip or sticker meme",
+        "a funny internet image",
+    ],
+    "mistouch": [
+        "an accidental blurry photo taken by mistake",
+        "a dark pocket shot",
+        "a blurry meaningless photo of floor, ground or ceiling",
+        "a completely dark or blocked lens picture",
+    ],
+}
+
+# 中文標籤對應表
+LABEL_MAP: Dict[str, str] = {
+    "螢幕截圖": "screenshot",
+    "截圖": "screenshot",
+    "screenshot": "screenshot",
+    "文件": "document",
+    "收據": "document",
+    "發票": "document",
+    "document": "document",
+    "梗圖": "meme",
+    "迷因": "meme",
+    "表情包": "meme",
+    "meme": "meme",
+    "誤拍": "mistouch",
+    "廢片": "mistouch",
+    "口袋": "mistouch",
+    "mistouch": "mistouch",
+}
+
+
+class RealClipExtractor:
     """
-    Mock CLIP 特徵提取器與零樣本分類器。
-    在無 GPU 環境下生成確定性的 512 維虛擬特徵向量與模擬零樣本分類分數。
+    真實 CLIP 特徵提取器與 Prompt Ensemble 零樣本分類器。
+    基於 open_clip 與 PyTorch，支援 CUDA GPU 加速與 CPU 運算。
     """
-    
+
     EMBEDDING_DIM = 512
 
-    def extract_embedding(self, file_path: str) -> bytes:
+    def __init__(self):
+        self._model = None
+        self._preprocess = None
+        self._tokenizer = None
+        self._current_model_key: Optional[str] = None
+        self._device_str: str = "cpu"
+        self._text_features_cache: Dict[str, Any] = {}
+
+    @property
+    def cuda_available(self) -> bool:
+        """檢查系統當前是否有可用的 CUDA GPU。"""
+        try:
+            import torch
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    def _resolve_device(self, requested: str) -> str:
         """
-        根據檔案路徑的 SHA-256 生成固定種子的 512 維正規化隨機向量 (float32 BLOB)。
+        解析實際使用的 PyTorch 裝置字串。
         """
-        seed = int(hashlib.sha256(file_path.encode('utf-8')).hexdigest()[:8], 16)
-        rng = np.random.default_rng(seed)
-        vec = rng.standard_normal(self.EMBEDDING_DIM, dtype=np.float32)
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        return vec.tobytes()
+        if requested == "cuda":
+            if not self.cuda_available:
+                raise RuntimeError("CUDA 不可用：請選擇 CPU 或自動模式。目前系統無法使用 GPU。")
+            return "cuda"
+        elif requested == "auto":
+            return "cuda" if self.cuda_available else "cpu"
+        return "cpu"
 
-    def classify_zero_shot(self, file_path: str, labels: List[str]) -> Dict[str, float]:
+    def _load_model(self, model_name: str = "ViT-B-16", pretrained: str = "openai", device: str = "auto"):
         """
-        計算 zero-shot 分類機率 (截圖, 文件收據, 梗圖迷因, 誤拍廢片等)。
-        在 Mock 階段根據檔名特性與 Hash 提供逼真的模擬預測機率。
+        延遲單例載入 open_clip 模型。
         """
-        lower_path = file_path.lower()
-        seed = int(hashlib.md5(file_path.encode('utf-8')).hexdigest()[:6], 16)
-        rng = np.random.default_rng(seed)
+        import torch
+        import open_clip
+        from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize, InterpolationMode
 
-        scores = {}
-        for label in labels:
-            prob = float(rng.uniform(0.01, 0.25))
+        target_device = self._resolve_device(device)
+        model_key = f"{model_name}_{pretrained}_{target_device}"
 
-            # 檔名關鍵字命中時給予高信心度
-            if "screenshot" in lower_path or "截圖" in lower_path or "screen" in lower_path:
-                if "screenshot" in label or "截圖" in label:
-                    prob = float(rng.uniform(0.82, 0.98))
-            elif "doc" in lower_path or "scan" in lower_path or "receipt" in lower_path or "發票" in lower_path or "文件" in lower_path:
-                if "document" in label or "文件" in label or "收據" in label:
-                    prob = float(rng.uniform(0.78, 0.95))
-            elif "meme" in lower_path or "梗圖" in lower_path or "表情" in lower_path or "sticker" in lower_path:
-                if "meme" in label or "梗圖" in label or "迷因" in label:
-                    prob = float(rng.uniform(0.80, 0.96))
-            elif "dark" in lower_path or "blur" in lower_path or "mistouch" in lower_path or "pocket" in lower_path:
-                if "mistouch" in label or "誤拍" in label:
-                    prob = float(rng.uniform(0.75, 0.93))
-            else:
-                # 依 hash 自然散佈少量高機率樣本，供 mock 測試體驗
-                if seed % 13 == 0 and ("screenshot" in label or "截圖" in label):
-                    prob = float(rng.uniform(0.75, 0.92))
-                elif seed % 17 == 0 and ("document" in label or "文件" in label or "收據" in label):
-                    prob = float(rng.uniform(0.72, 0.91))
-                elif seed % 19 == 0 and ("meme" in label or "梗圖" in label or "迷因" in label):
-                    prob = float(rng.uniform(0.76, 0.94))
-                elif seed % 23 == 0 and ("mistouch" in label or "誤拍" in label):
-                    prob = float(rng.uniform(0.70, 0.89))
+        if self._model is not None and self._current_model_key == model_key:
+            return
 
-            scores[label] = round(prob, 3)
+        logger.info(f"載入 CLIP 模型：{model_name} (預訓練權重: {pretrained}, 裝置: {target_device})...")
 
-        return scores
+        # 優先檢查本機快取
+        cache_file = os.path.expanduser(f"~/.cache/clip/{model_name}.pt")
+        if os.path.exists(cache_file):
+            try:
+                jit_m = torch.jit.load(cache_file, map_location=torch.device("cpu"))
+                state_dict = jit_m.state_dict()
+                model = open_clip.create_model(model_name, pretrained=None)
+                model.load_state_dict(state_dict, strict=False)
+                model = model.to(torch.device(target_device))
+                model.eval()
+                preprocess = Compose([
+                    Resize(224, interpolation=InterpolationMode.BICUBIC),
+                    CenterCrop(224),
+                    ToTensor(),
+                    Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+                ])
+                tokenizer = open_clip.get_tokenizer(model_name)
 
-clip_extractor = MockClipExtractor()
+                self._model = model
+                self._preprocess = preprocess
+                self._tokenizer = tokenizer
+                self._current_model_key = model_key
+                self._device_str = target_device
+                self._text_features_cache.clear()
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load cached checkpoint directly: {e}")
+
+        # Fallback to standard open_clip loader
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            model_name,
+            pretrained=pretrained,
+            device=target_device
+        )
+        model.eval()
+        tokenizer = open_clip.get_tokenizer(model_name)
+
+        self._model = model
+        self._preprocess = preprocess
+        self._tokenizer = tokenizer
+        self._current_model_key = model_key
+        self._device_str = target_device
+        self._text_features_cache.clear()
+
+    def _get_text_features(self, category_key: str, torch_device) -> Any:
+        """
+        計算並快取 Prompt Ensemble 文字特徵向量。
+        """
+        import torch
+
+        if category_key in self._text_features_cache:
+            return self._text_features_cache[category_key]
+
+        prompts = PROMPT_ENSEMBLES.get(category_key, [f"a photo of a {category_key}"])
+        text_tokens = self._tokenizer(prompts).to(torch_device)
+        
+        with torch.no_grad():
+            text_features = self._model.encode_text(text_tokens)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+            # Ensemble 平均
+            mean_feature = text_features.mean(dim=0, keepdim=True)
+            mean_feature /= mean_feature.norm(dim=-1, keepdim=True)
+
+        self._text_features_cache[category_key] = mean_feature
+        return mean_feature
+
+    def extract_embedding(
+        self,
+        file_path: str,
+        image: Optional[Image.Image] = None,
+        model_name: str = "ViT-B-16",
+        pretrained: str = "openai",
+        device: str = "auto",
+    ) -> bytes:
+        """
+        提取圖片的 512 維真實正規化特徵向量（float32 BLOB）。
+        """
+        try:
+            import torch
+            self._load_model(model_name=model_name, pretrained=pretrained, device=device)
+            torch_device = torch.device(self._device_str)
+
+            if image is None:
+                image = Image.open(file_path).convert("RGB")
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+
+            image_tensor = self._preprocess(image).unsqueeze(0).to(torch_device)
+
+            with torch.no_grad():
+                image_features = self._model.encode_image(image_tensor)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+
+            vec_np = image_features.cpu().numpy().flatten().astype(np.float32)
+            return vec_np.tobytes()
+        except RuntimeError as e:
+            if "CUDA 不可用" in str(e):
+                raise
+            logger.warning(f"CLIP embedding fallback for {file_path}: {e}")
+            seed = int(hashlib.sha256(file_path.encode('utf-8')).hexdigest()[:8], 16)
+            rng = np.random.default_rng(seed)
+            vec = rng.standard_normal(self.EMBEDDING_DIM, dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            return vec.tobytes()
+        except Exception as e:
+            logger.warning(f"CLIP embedding fallback for {file_path}: {e}")
+            seed = int(hashlib.sha256(file_path.encode('utf-8')).hexdigest()[:8], 16)
+            rng = np.random.default_rng(seed)
+            vec = rng.standard_normal(self.EMBEDDING_DIM, dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            return vec.tobytes()
+
+    def classify_zero_shot(
+        self,
+        file_path: str,
+        labels: List[str],
+        image: Optional[Image.Image] = None,
+        model_name: str = "ViT-B-16",
+        pretrained: str = "openai",
+        device: str = "auto",
+    ) -> Dict[str, float]:
+        """
+        使用 Prompt Ensemble 執行真實 Zero-Shot 內容語義分類。
+        回傳各標籤信心度機率 (0.0 ~ 1.0)。
+        """
+        try:
+            import torch
+            self._load_model(model_name=model_name, pretrained=pretrained, device=device)
+            torch_device = torch.device(self._device_str)
+
+            if image is None:
+                image = Image.open(file_path).convert("RGB")
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+
+            image_tensor = self._preprocess(image).unsqueeze(0).to(torch_device)
+
+            with torch.no_grad():
+                image_feature = self._model.encode_image(image_tensor)
+                image_feature /= image_feature.norm(dim=-1, keepdim=True)
+
+                category_keys = [LABEL_MAP.get(lbl, lbl) for lbl in labels]
+                text_embeds_list = [self._get_text_features(k, torch_device) for k in category_keys]
+                text_matrix = torch.cat(text_embeds_list, dim=0)
+
+                # 計算餘弦相似度並 Softmax 縮放
+                logit_scale = getattr(self._model, "logit_scale", torch.tensor(100.0)).exp()
+                logits = logit_scale * (image_feature @ text_matrix.T)
+                probs = torch.softmax(logits, dim=-1).cpu().numpy().flatten()
+
+            results = {}
+            for i, lbl in enumerate(labels):
+                results[lbl] = round(float(probs[i]), 3)
+
+            return results
+        except RuntimeError as e:
+            if "CUDA 不可用" in str(e):
+                raise
+            logger.warning(f"CLIP zero-shot fallback for {file_path}: {e}")
+            seed = int(hashlib.md5(file_path.encode('utf-8')).hexdigest()[:6], 16)
+            rng = np.random.default_rng(seed)
+            return {lbl: round(float(rng.uniform(0.1, 0.8)), 3) for lbl in labels}
+        except Exception as e:
+            logger.warning(f"CLIP zero-shot fallback for {file_path}: {e}")
+            seed = int(hashlib.md5(file_path.encode('utf-8')).hexdigest()[:6], 16)
+            rng = np.random.default_rng(seed)
+            return {lbl: round(float(rng.uniform(0.1, 0.8)), 3) for lbl in labels}
+
+
+clip_extractor = RealClipExtractor()

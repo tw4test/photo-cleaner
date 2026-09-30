@@ -1,18 +1,23 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { FolderPlus, Play, Folder, Trash2, CheckCircle2, AlertCircle } from 'lucide-react'
+import { CheckCircle2, AlertCircle, RefreshCw } from 'lucide-react'
 import { api } from '../services/api'
-import { RootItem, ScanProgressState } from '../services/types'
+import { RootItem, AnalysisStatus, ScanSummary, ScanProgressState } from '../services/types'
 import { useScanProgress } from '../hooks/useScanProgress'
 import { ScanProgressBar } from '../components/common/ScanProgressBar'
+import { ScanPanel } from '../components/scan/ScanPanel'
+import { AnalysisPanel } from '../components/scan/AnalysisPanel'
+import { EvaluatePanel } from '../components/scan/EvaluatePanel'
 
 export const Library: React.FC = () => {
   const navigate = useNavigate()
   const [roots, setRoots] = useState<RootItem[]>([])
-  const [newPath, setNewPath] = useState('')
+  const [analysisStatus, setAnalysisStatus] = useState<AnalysisStatus | null>(null)
+  const [scanSummary, setScanSummary] = useState<ScanSummary | null>(null)
   const [loading, setLoading] = useState(false)
+  const [statusLoading, setStatusLoading] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
-  const [showProgressCard, setShowProgressCard] = useState(true)
+  const [showProgressCard, setShowProgressCard] = useState(false)
 
   const loadRoots = useCallback(async () => {
     try {
@@ -26,24 +31,42 @@ export const Library: React.FC = () => {
     }
   }, [])
 
-  // Hook for real-time scanning progress tracking (SSE + Polling fallback)
+  const loadAnalysisStatus = useCallback(async () => {
+    try {
+      setStatusLoading(true)
+      const data = await api.getAnalysisStatus()
+      setAnalysisStatus(data)
+    } catch (err) {
+      console.error('Failed to load analysis status:', err)
+    } finally {
+      setStatusLoading(false)
+    }
+  }, [])
+
+  const loadAll = useCallback(() => {
+    loadRoots()
+    loadAnalysisStatus()
+  }, [loadRoots, loadAnalysisStatus])
+
+  // Hook for real-time task progress tracking (SSE + Polling fallback)
   const { progress, isScanning, cancelScan } = useScanProgress(
-    useCallback((_completedState: ScanProgressState) => {
-      loadRoots()
+    useCallback((completedState: ScanProgressState) => {
+      loadAll()
+      if (completedState.scan_summary) {
+        setScanSummary(completedState.scan_summary)
+      }
       setShowProgressCard(true)
-    }, [loadRoots])
+    }, [loadAll])
   )
 
   useEffect(() => {
-    loadRoots()
-  }, [loadRoots])
+    loadAll()
+  }, [loadAll])
 
-  const handleAddRoot = async () => {
-    if (!newPath.trim()) return
+  const handleAddRoot = async (path: string) => {
     try {
       setMessage(null)
-      await api.createRoot({ path: newPath.trim() })
-      setNewPath('')
+      await api.createRoot({ path })
       setMessage({ type: 'success', text: '已成功新增掃描目錄！' })
       loadRoots()
     } catch (err: any) {
@@ -61,41 +84,84 @@ export const Library: React.FC = () => {
     }
   }
 
-  const handleTriggerScan = async (rootId?: number) => {
+  const handleTriggerScan = async (mode: 'full' | 'new_only', rootId?: number) => {
     try {
       setMessage(null)
       setShowProgressCard(true)
-      if (rootId) {
-        await api.triggerScan(rootId)
-      } else {
-        await api.triggerScanAll()
-      }
+      await api.triggerJobScan(mode, rootId)
     } catch (err: any) {
       const errorMsg = err.response?.data?.detail || '啟動掃描失敗。'
       setMessage({ type: 'error', text: errorMsg })
     }
   }
 
+  const handleTriggerAnalyze = async (stages: string[], device: string, retryFailed: boolean) => {
+    try {
+      setMessage(null)
+      setShowProgressCard(true)
+      await api.triggerJobAnalyze(stages, device, retryFailed)
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.detail || '啟動特徵分析失敗。'
+      setMessage({ type: 'error', text: errorMsg })
+    }
+  }
+
+  const handleTriggerRebuildThumbs = async () => {
+    try {
+      setMessage(null)
+      setShowProgressCard(true)
+      await api.triggerRebuildThumbs()
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.detail || '啟動縮圖補算失敗。'
+      setMessage({ type: 'error', text: errorMsg })
+    }
+  }
+
+  const handleTriggerEvaluate = async () => {
+    try {
+      setMessage(null)
+      setShowProgressCard(true)
+      await api.triggerEvaluate()
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.detail || '啟動規則評估失敗。'
+      setMessage({ type: 'error', text: errorMsg })
+    }
+  }
+
+  const handleTriggerFullPipeline = async () => {
+    try {
+      setMessage(null)
+      setShowProgressCard(true)
+      // 1. 觸發完整掃描
+      await api.triggerJobScan('full')
+      // 伺服器會在完成後由使用者或串接後續分析
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.detail || '啟動流水線失敗。'
+      setMessage({ type: 'error', text: errorMsg })
+    }
+  }
+
   return (
     <div className="p-8 space-y-8 overflow-y-auto max-w-7xl mx-auto w-full">
-      {/* Header */}
+      {/* Page Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-2xl font-bold text-slate-100">資料庫掃描（Library）</h2>
-          <p className="text-slate-400 text-sm mt-1">管理相片掃描目錄、路徑優先順序與即時透明掃描</p>
+          <h2 className="text-2xl font-bold text-slate-100">資料庫與分析工作台（Library & Analysis）</h2>
+          <p className="text-slate-400 text-sm mt-1">
+            目錄掃描、特徵提取與規則評估徹底獨立運作，支援精細控制與即時透明進度追蹤
+          </p>
         </div>
         <button
-          disabled={roots.length === 0 || isScanning}
-          onClick={() => handleTriggerScan()}
-          className="flex items-center gap-2 px-4 py-2 bg-sky-600 hover:bg-sky-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-sm font-medium transition-all shadow-lg shadow-sky-600/20 cursor-pointer"
+          onClick={loadAll}
+          className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-medium border border-slate-700 transition-colors cursor-pointer"
         >
-          <Play className="w-4 h-4" />
-          <span>{isScanning ? '掃描進行中...' : '開始全庫掃描'}</span>
+          <RefreshCw className={`w-3.5 h-3.5 ${loading || statusLoading ? 'animate-spin' : ''}`} />
+          <span>重新整理全頁</span>
         </button>
       </div>
 
       {/* Real-time Transparent Progress Bar Card */}
-      {showProgressCard && (
+      {(showProgressCard || isScanning) && (
         <ScanProgressBar
           progress={progress}
           onCancel={cancelScan}
@@ -116,81 +182,33 @@ export const Library: React.FC = () => {
         </div>
       )}
 
-      {/* Add Path Input */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <h3 className="text-base font-semibold text-slate-200">新增相片來源目錄</h3>
-        <div className="flex gap-3">
-          <input
-            type="text"
-            value={newPath}
-            onChange={(e) => setNewPath(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleAddRoot()}
-            placeholder="請輸入本機絕對路徑，例如：D:\Photos\2023 或 D:\Pictures"
-            className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 font-mono"
-          />
-          <button
-            onClick={handleAddRoot}
-            className="flex items-center gap-2 px-5 py-2.5 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-sm font-medium transition-colors shadow-md shadow-sky-600/20 cursor-pointer"
-          >
-            <FolderPlus className="w-4 h-4" />
-            <span>加入路徑</span>
-          </button>
-        </div>
-      </div>
+      {/* Panel 1: Scan Panel */}
+      <ScanPanel
+        roots={roots}
+        loading={loading}
+        isScanning={isScanning}
+        scanSummary={scanSummary}
+        onAddRoot={handleAddRoot}
+        onDeleteRoot={handleDeleteRoot}
+        onTriggerScan={handleTriggerScan}
+      />
 
-      {/* Path List */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="text-base font-semibold text-slate-200">已登錄掃描路徑清單</h3>
-          <span className="text-xs text-slate-500">提示：越上方的路徑在重複比對時享有更高的保留優先權</span>
-        </div>
+      {/* Panel 2: Analysis Panel */}
+      <AnalysisPanel
+        status={analysisStatus}
+        loading={statusLoading}
+        isAnalyzing={isScanning}
+        onTriggerAnalyze={handleTriggerAnalyze}
+        onTriggerRebuildThumbs={handleTriggerRebuildThumbs}
+        onRefreshStatus={loadAnalysisStatus}
+      />
 
-        {loading ? (
-          <div className="text-center py-12 text-slate-500">載入中...</div>
-        ) : roots.length === 0 ? (
-          <div className="text-center py-12 border border-dashed border-slate-800 rounded-xl space-y-3">
-            <Folder className="w-10 h-10 text-slate-600 mx-auto" />
-            <p className="text-sm text-slate-400">目前尚無已登錄路徑，請在上方輸入資料夾路徑</p>
-          </div>
-        ) : (
-          <div className="divide-y divide-slate-800/80">
-            {roots.map((root, index) => (
-              <div key={root.id} className="py-4 flex items-center justify-between first:pt-0 last:pb-0">
-                <div className="space-y-1">
-                  <div className="flex items-center gap-2">
-                    <span className="px-2 py-0.5 bg-slate-800 text-sky-400 rounded-md text-xs font-mono font-bold">
-                      優先序 #{index + 1}
-                    </span>
-                    <span className="font-mono text-sm text-slate-200 font-semibold">{root.path}</span>
-                  </div>
-                  <div className="text-xs text-slate-500">
-                    上次掃描時間：{root.last_scan_at ? new Date(root.last_scan_at).toLocaleString('zh-TW') : '尚未掃描'}
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => handleTriggerScan(root.id)}
-                    disabled={isScanning}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 rounded-lg text-xs font-medium border border-slate-700 transition-colors cursor-pointer"
-                  >
-                    <Play className="w-3.5 h-3.5 text-sky-400" />
-                    <span>掃描此目錄</span>
-                  </button>
-                  <button
-                    onClick={() => handleDeleteRoot(root.id)}
-                    disabled={isScanning}
-                    className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-rose-950/20 disabled:opacity-40 rounded-lg transition-colors cursor-pointer"
-                    title="移除路徑"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+      {/* Panel 3: Evaluate Panel */}
+      <EvaluatePanel
+        isRunning={isScanning}
+        onTriggerEvaluate={handleTriggerEvaluate}
+        onTriggerFullPipeline={handleTriggerFullPipeline}
+      />
     </div>
   )
 }

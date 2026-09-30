@@ -8,10 +8,51 @@ export interface RootItem {
   available: boolean
 }
 
+export interface ScanSummary {
+  added: number
+  modified: number
+  missing: number
+  unchanged: number
+}
+
+export interface StageStats {
+  pending: number
+  done: number
+  not_needed?: number
+  failed: number
+  stale?: number
+}
+
+export interface AnalysisStatus {
+  stages: {
+    hash: StageStats
+    basic: StageStats
+    clip: StageStats
+    video: StageStats
+  }
+  clip_model: string
+  clip_pretrained: string
+  device: string
+}
+
+export interface AnalysisFailureItem {
+  id: number
+  asset_id: number
+  stage: string
+  error_msg: string | null
+  occurred_at: string | null
+  primary_path: string
+  media_type: string
+}
+
 export interface ScanProgressState {
   is_scanning: boolean
-  stage: 'idle' | 'discovering' | 'processing' | 'evaluating_rules' | 'completed' | 'error'
+  is_running?: boolean
+  job_type?: string // 'idle' | 'scan' | 'analyze' | 'rebuild_thumbs' | 'evaluate'
+  stage: string
   stage_label: string
+  current_stage?: string
+  device_used?: string
   total_files: number
   processed_files: number
   percentage: number
@@ -20,6 +61,8 @@ export interface ScanProgressState {
   eta_seconds: number | null
   new_assets_count: number
   new_candidates_count: number
+  scan_summary?: ScanSummary
+  stage_stats?: Record<string, any>
   error_message: string | null
   duration_seconds: number
 }

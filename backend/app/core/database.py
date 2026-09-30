@@ -46,6 +46,15 @@ async def get_db():
         finally:
             await session.close()
 
+from app.core.migration import run_migrations
+
 def init_db():
-    """Create all tables in SQLite database and configure WAL."""
-    Base.metadata.create_all(bind=sync_engine)
+    """Create all tables in SQLite database, configure WAL, and run migrations."""
+    from app.models.schema import Base as SchemaBase
+    SchemaBase.metadata.create_all(bind=sync_engine)
+
+    # 執行資料庫版本遷移（冪等）
+    from app.core.config import settings as _settings
+    db_path = _settings.DATA_DIR / "app.db"
+    run_migrations(sync_engine, db_path)
+

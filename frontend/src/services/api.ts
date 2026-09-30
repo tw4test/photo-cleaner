@@ -7,7 +7,9 @@ import {
   DeletionResult, 
   BatchSummaryItem, 
   ActionLogItem,
-  ScanProgressState 
+  ScanProgressState,
+  AnalysisStatus,
+  AnalysisFailureItem
 } from './types'
 
 const apiClient = axios.create({
@@ -24,7 +26,22 @@ export const api = {
     apiClient.post<RootItem>('/roots', data).then(res => res.data),
   deleteRoot: (id: number) => apiClient.delete(`/roots/${id}`).then(res => res.data),
 
-  // Scan & Live Progress
+  // Jobs API (New split scan / analyze / evaluate)
+  triggerJobScan: (mode: 'full' | 'new_only' = 'full', rootId?: number) =>
+    apiClient.post('/jobs/scan', { mode, root_id: rootId }).then(res => res.data),
+  triggerJobAnalyze: (stages: string[] = ['hash', 'basic', 'clip', 'video'], device: string = 'auto', retryFailed: boolean = false) =>
+    apiClient.post('/jobs/analyze', { stages, device, retry_failed: retryFailed }).then(res => res.data),
+  triggerRebuildThumbs: () => apiClient.post('/jobs/rebuild_thumbs').then(res => res.data),
+  triggerEvaluate: () => apiClient.post('/jobs/evaluate').then(res => res.data),
+  getJobStatus: () => apiClient.get<ScanProgressState>('/jobs/status').then(res => res.data),
+  cancelJob: () => apiClient.post('/jobs/cancel').then(res => res.data),
+
+  // Analysis status & failures
+  getAnalysisStatus: () => apiClient.get<AnalysisStatus>('/analysis/status').then(res => res.data),
+  getAnalysisFailures: (stage?: string) =>
+    apiClient.get<AnalysisFailureItem[]>('/analysis/failures', { params: { stage } }).then(res => res.data),
+
+  // Legacy Scan & Live Progress (Backward-compatible)
   triggerScan: (rootId: number) => apiClient.post(`/scan/${rootId}`).then(res => res.data),
   triggerScanAll: () => apiClient.post('/scan/all').then(res => res.data),
   getScanStatus: () => apiClient.get<ScanProgressState>('/scan/status').then(res => res.data),

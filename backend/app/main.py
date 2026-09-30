@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import init_db
 from app.api import roots, scan, thumbnails, dashboard, candidates, process, history, settings as app_settings
+from app.api import jobs, analysis
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -42,6 +43,9 @@ app.include_router(candidates.router)
 app.include_router(process.router)
 app.include_router(history.router)
 app.include_router(app_settings.router)
+# New routers (post scan/analysis split)
+app.include_router(jobs.router)
+app.include_router(analysis.router)
 
 @app.get("/api/health")
 async def health_check():

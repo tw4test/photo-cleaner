@@ -54,4 +54,21 @@ class DeletionMode(str, Enum):
 class DecodeStatus(str, Enum):
     OK = "ok"
     FALLBACK = "fallback"
-    FAILED = "failed"
+    ERROR = "error"   # 解碼失敗（用於失敗記錄）
+
+class HashState(str, Enum):
+    PENDING = "pending"
+    DONE = "done"
+    NOT_NEEDED = "not_needed"
+    ERROR = "error"
+
+class AnalysisStage(str, Enum):
+    HASH = "hash"
+    BASIC = "basic"
+    CLIP = "clip"
+    VIDEO = "video"
+
+class ComputeDevice(str, Enum):
+    AUTO = "auto"
+    CUDA = "cuda"
+    CPU = "cpu"

@@ -48,6 +48,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # 刪除與安全
     "deletion_mode": "trash",
     "auto_evaluate_on_save": True,
+
+    # CLIP 模型設定
+    "clip_model": "ViT-B-16",           # 模型名稱
+    "clip_pretrained": "openai",        # 預訓練權重
+    "compute_device": "auto",           # 全域運算裝置預設：auto | cuda | cpu
 }
 
 class SettingsUpdate(BaseModel):
