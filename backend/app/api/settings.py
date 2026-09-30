@@ -28,10 +28,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "rule_mistouch_enabled": True,           # 誤拍/口袋/地板廢片辨識
 
     # AI 信心度門檻 (0.0 ~ 1.0)
-    "screenshot_threshold": 0.70,            # 截圖信心度門檻
-    "document_threshold": 0.65,              # 文件收據信心度門檻
-    "meme_threshold": 0.75,                  # 梗圖迷因信心度門檻
-    "mistouch_threshold": 0.60,              # 誤拍廢片信心度門檻
+    "screenshot_threshold": 0.60,            # 截圖信心度門檻
+    "document_threshold": 0.55,              # 文件收據信心度門檻
+    "meme_threshold": 0.65,                  # 梗圖迷因信心度門檻
+    "mistouch_threshold": 0.55,              # 誤拍廢片信心度門檻
 
     # 傳統特徵門檻
     "phash_threshold": 6,                    # pHash 漢明距離門檻 (0-20)

@@ -11,34 +11,45 @@ logger = logging.getLogger(__name__)
 
 # 標準 Prompt Ensemble 模板集合
 PROMPT_ENSEMBLES: Dict[str, List[str]] = {
+    "normal_photo": [
+        "a regular photograph of people, family, kids, children, portrait or group photo",
+        "a photograph of people on a stage at an event, celebration, performance or ceremony",
+        "a photograph of outdoor scenery, travel, landscape, nature, city street",
+        "a photograph of food, dish, meals, pets, animals, or objects",
+        "a clear standard camera photograph of daily life",
+        "a portrait photo of smiling people",
+    ],
     "screenshot": [
-        "a screenshot",
-        "a screenshot of a user interface",
-        "a screenshot of a mobile or computer screen",
-        "a screen capture of an application",
+        "a digital screenshot of a mobile phone screen showing app interface, status bar, and time",
+        "a digital screenshot of a computer monitor, desktop window, or website browser",
+        "a digital screenshot of a messaging chat conversation, SMS, or social media app interface",
     ],
     "document": [
-        "a photo of a printed paper document",
-        "a photo of a receipt or invoice",
-        "a handwritten note or whiteboard",
-        "a page of a book or document",
+        "a photo of a paper receipt, payment invoice, store ticket with prices and text",
+        "a photo of a printed paper document, form, bill, contract, or page of a book",
+        "a close-up photo of printed text on white paper or receipt paper",
+        "a photo of handwritten notes on paper, notebook, or whiteboard",
+        "a table spreadsheet or receipt with line items and numbers on paper",
     ],
     "meme": [
-        "an internet meme with text overlay",
-        "a funny meme picture",
-        "a comic strip or sticker meme",
-        "a funny internet image",
+        "an internet meme with funny text captions in Impact font",
+        "a funny viral internet meme image, reaction picture, or cartoon sticker",
+        "a comic strip or comic illustration meme",
     ],
     "mistouch": [
-        "an accidental blurry photo taken by mistake",
-        "a dark pocket shot",
-        "a blurry meaningless photo of floor, ground or ceiling",
-        "a completely dark or blocked lens picture",
+        "an accidental completely black dark photo taken inside a dark pocket or purse",
+        "an accidental blurry photo of floor tiles, asphalt ground, carpet or blank ceiling",
+        "an extreme blurry unusable photo taken by accident with lens completely covered",
     ],
 }
 
 # 中文標籤對應表
 LABEL_MAP: Dict[str, str] = {
+    "normal_photo": "normal_photo",
+    "photo": "normal_photo",
+    "相片": "normal_photo",
+    "正常相片": "normal_photo",
+    "一般相片": "normal_photo",
     "螢幕截圖": "screenshot",
     "截圖": "screenshot",
     "screenshot": "screenshot",
@@ -263,7 +274,12 @@ class RealClipExtractor:
                 image_feature /= image_feature.norm(dim=-1, keepdim=True)
 
                 category_keys = [LABEL_MAP.get(lbl, lbl) for lbl in labels]
-                text_embeds_list = [self._get_text_features(k, torch_device) for k in category_keys]
+                eval_keys = list(category_keys)
+                has_normal = "normal_photo" in eval_keys
+                if not has_normal:
+                    eval_keys.append("normal_photo")
+
+                text_embeds_list = [self._get_text_features(k, torch_device) for k in eval_keys]
                 text_matrix = torch.cat(text_embeds_list, dim=0)
 
                 # 計算餘弦相似度並 Softmax 縮放
@@ -275,19 +291,22 @@ class RealClipExtractor:
             for i, lbl in enumerate(labels):
                 results[lbl] = round(float(probs[i]), 3)
 
+            if not has_normal:
+                results["normal_photo"] = round(float(probs[-1]), 3)
+
             return results
         except RuntimeError as e:
             if "CUDA 不可用" in str(e):
                 raise
             logger.warning(f"CLIP zero-shot fallback for {file_path}: {e}")
-            seed = int(hashlib.md5(file_path.encode('utf-8')).hexdigest()[:6], 16)
-            rng = np.random.default_rng(seed)
-            return {lbl: round(float(rng.uniform(0.1, 0.8)), 3) for lbl in labels}
+            res = {lbl: 0.0 for lbl in labels}
+            res["normal_photo"] = 1.0
+            return res
         except Exception as e:
             logger.warning(f"CLIP zero-shot fallback for {file_path}: {e}")
-            seed = int(hashlib.md5(file_path.encode('utf-8')).hexdigest()[:6], 16)
-            rng = np.random.default_rng(seed)
-            return {lbl: round(float(rng.uniform(0.1, 0.8)), 3) for lbl in labels}
+            res = {lbl: 0.0 for lbl in labels}
+            res["normal_photo"] = 1.0
+            return res
 
 
 clip_extractor = RealClipExtractor()

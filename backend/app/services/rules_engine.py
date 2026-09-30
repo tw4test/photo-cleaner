@@ -27,10 +27,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "blur_threshold": 100.0,
     "under_exposure_threshold": 30.0,
     "over_exposure_threshold": 225.0,
-    "screenshot_threshold": 0.70,        # 截圖信心度門檻 (0.0~1.0)
-    "document_threshold": 0.65,          # 文件/收據信心度門檻 (0.0~1.0)
-    "meme_threshold": 0.75,              # 梗圖迷因信心度門檻 (0.0~1.0)
-    "mistouch_threshold": 0.60,          # 誤拍廢片信心度門檻 (0.0~1.0)
+    "screenshot_threshold": 0.60,        # 截圖信心度門檻 (0.0~1.0)
+    "document_threshold": 0.55,          # 文件/收據信心度門檻 (0.0~1.0)
+    "meme_threshold": 0.65,              # 梗圖迷因信心度門檻 (0.0~1.0)
+    "mistouch_threshold": 0.55,          # 誤拍廢片信心度門檻 (0.0~1.0)
     "burst_time_window_seconds": 2.0,
     "burst_similarity_threshold": 0.85,
     "video_tiny_threshold_kb": 100,
@@ -287,10 +287,10 @@ class RulesEngine:
         meme_enabled = config.get("rule_meme_enabled", True)
         mistouch_enabled = config.get("rule_mistouch_enabled", True)
 
-        screenshot_th = float(config.get("screenshot_threshold", 0.70))
-        document_th = float(config.get("document_threshold", 0.65))
-        meme_th = float(config.get("meme_threshold", 0.75))
-        mistouch_th = float(config.get("mistouch_threshold", 0.60))
+        screenshot_th = float(config.get("screenshot_threshold", 0.60))
+        document_th = float(config.get("document_threshold", 0.55))
+        meme_th = float(config.get("meme_threshold", 0.65))
+        mistouch_th = float(config.get("mistouch_threshold", 0.55))
 
         # A-17: 取得目前設定的 CLIP 模型
         current_clip_model = config.get("clip_model", "ViT-B-16")
@@ -341,11 +341,13 @@ class RulesEngine:
             except Exception:
                 pass
 
+            normal_score = float(zs.get("normal_photo", 0.0))
+
             # 1. 螢幕截圖檢查
             for key in ["screenshot", "螢幕截圖", "截圖"]:
                 if key in zs and screenshot_enabled:
                     score = float(zs[key])
-                    if score >= screenshot_th:
+                    if score >= screenshot_th and score > normal_score:
                         session.add(Candidate(
                             asset_id=asset.id,
                             rule=CandidateRule.SCREENSHOT.value,
@@ -361,7 +363,7 @@ class RulesEngine:
             for key in ["document", "文件", "收據", "發票"]:
                 if key in zs and document_enabled:
                     score = float(zs[key])
-                    if score >= document_th:
+                    if score >= document_th and score > normal_score:
                         session.add(Candidate(
                             asset_id=asset.id,
                             rule=CandidateRule.DOCUMENT.value,
@@ -377,7 +379,7 @@ class RulesEngine:
             for key in ["meme", "梗圖", "迷因", "表情包"]:
                 if key in zs and meme_enabled:
                     score = float(zs[key])
-                    if score >= meme_th:
+                    if score >= meme_th and score > normal_score:
                         session.add(Candidate(
                             asset_id=asset.id,
                             rule=CandidateRule.MEME.value,
@@ -393,7 +395,7 @@ class RulesEngine:
             for key in ["mistouch", "誤拍", "廢片"]:
                 if key in zs and mistouch_enabled:
                     score = float(zs[key])
-                    if score >= mistouch_th:
+                    if score >= mistouch_th and score > normal_score:
                         session.add(Candidate(
                             asset_id=asset.id,
                             rule=CandidateRule.MISTOUCH.value,
