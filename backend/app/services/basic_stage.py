@@ -129,15 +129,21 @@ def run_basic_stage(
         .all()
     )
 
-    logger.info("basic_stage: evaluating %d candidate asset(s)", len(candidates))
+    total_candidates = len(candidates)
+    if progress_tracker:
+        progress_tracker.set_current_stage("basic", total=total_candidates)
 
-    for asset in candidates:
+    logger.info("basic_stage: evaluating %d candidate asset(s)", total_candidates)
+
+    for idx, asset in enumerate(candidates):
         # Respect cancellation
         if progress_tracker is not None and progress_tracker.is_cancel_requested():
             logger.info("basic_stage: cancel requested, stopping early")
             break
 
         if not _needs_processing(asset, retry_failed):
+            if progress_tracker:
+                progress_tracker.update_analyze_progress(idx + 1, total_candidates, asset.primary_path)
             continue
 
         stats["processed"] += 1
@@ -206,6 +212,10 @@ def run_basic_stage(
             session.flush()
             stats["failed"] += 1
 
+        finally:
+            if progress_tracker:
+                progress_tracker.update_analyze_progress(idx + 1, total_candidates, asset.primary_path)
+
     logger.info(
         "basic_stage complete — processed=%d done=%d failed=%d",
         stats["processed"],
@@ -239,9 +249,14 @@ def run_rebuild_thumbs_only(
         if a.features is not None and not _thumb_exists(a.primary_path)
     ]
 
-    logger.info("rebuild_thumbs: %d asset(s) need thumbnail rebuild", len(candidates_for_rebuild))
+    total = len(candidates_for_rebuild)
+    if progress_tracker:
+        progress_tracker.state.total_files = total
+        progress_tracker.broadcast()
 
-    for asset in candidates_for_rebuild:
+    logger.info("rebuild_thumbs: %d asset(s) need thumbnail rebuild", total)
+
+    for idx, asset in enumerate(candidates_for_rebuild):
         if progress_tracker is not None and progress_tracker.is_cancel_requested():
             break
         stats["processed"] += 1
@@ -251,6 +266,9 @@ def run_rebuild_thumbs_only(
         except Exception as exc:
             logger.warning("rebuild_thumbs: failed for %s — %s", asset.primary_path, exc)
             stats["failed"] += 1
+        finally:
+            if progress_tracker:
+                progress_tracker.update_analyze_progress(idx + 1, total, asset.primary_path)
 
     return stats
 

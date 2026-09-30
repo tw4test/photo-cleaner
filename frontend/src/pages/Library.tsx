@@ -142,7 +142,7 @@ export const Library: React.FC = () => {
   }
 
   return (
-    <div className="p-8 space-y-8 overflow-y-auto max-w-7xl mx-auto w-full">
+    <div className="p-8 space-y-8 overflow-y-auto max-w-7xl mx-auto w-full pb-36">
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div>

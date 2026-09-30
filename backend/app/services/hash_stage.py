@@ -188,10 +188,14 @@ def run_hash_stage(
         .all()
     )
 
-    logger.info("hash_stage: %d file(s) to hash", len(pending_files))
+    total_hash_files = len(pending_files)
+    if progress_tracker:
+        progress_tracker.set_current_stage("hash", total=total_hash_files)
+
+    logger.info("hash_stage: %d file(s) to hash", total_hash_files)
 
     # ── Step 6: Hash each pending file ────────────────────────────────────────
-    for file_record in pending_files:
+    for idx, file_record in enumerate(pending_files):
         # Respect cancellation request
         if progress_tracker is not None and progress_tracker.is_cancel_requested():
             logger.info("hash_stage: cancel requested, stopping early")
@@ -211,6 +215,10 @@ def run_hash_stage(
             file_record.hash_state = "error"
             _upsert_failure(session, file_record.asset_id, "hash", str(exc))
             stats["failed"] += 1
+
+        finally:
+            if progress_tracker:
+                progress_tracker.update_analyze_progress(idx + 1, total_hash_files, file_record.path)
 
         # Flush periodically to keep memory usage low
         session.flush()

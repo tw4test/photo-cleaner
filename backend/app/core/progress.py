@@ -139,19 +139,51 @@ class ProgressTracker:
     # ─── Analyze job ─────────────────────────────────────────────────
 
     def start_analyze(self, stages: list, device: str = "auto"):
-        label = f"準備分析（階段：{', '.join(stages)}）..."
+        stage_names = {
+            "hash": "檔案雜湊",
+            "basic": "基本特徵與縮圖",
+            "clip": "CLIP 語義向量",
+            "video": "影片資訊",
+        }
+        friendly_stages = [stage_names.get(s, s) for s in stages]
+        label = f"準備執行特徵分析（階段：{', '.join(friendly_stages)}）..."
         self._start_job("analyze", "pending", label)
         with self._lock:
             self.state.device_used = device
+            self._broadcast_internal()
 
-    def set_current_stage(self, stage_name: str, label: str = ""):
+    def set_current_stage(self, stage_name: str, total: int = 0, label: str = ""):
+        stage_labels = {
+            "hash": "正在計算檔案 SHA-256 雜湊 (Hash 階段)...",
+            "basic": "正在生成縮圖與計算相片特徵 (Basic 階段)...",
+            "clip": "正在執行 AI 語義向量提取與零樣本分類 (CLIP 階段)...",
+            "video": "正在解析影片資訊與首幀 (Video 階段)...",
+        }
         with self._lock:
             self.state.current_stage = stage_name
             self.state.stage = stage_name
-            self.state.stage_label = label or f"正在執行 {stage_name} 階段..."
+            self.state.stage_label = label or stage_labels.get(stage_name, f"正在執行 {stage_name} 階段...")
             self.state.processed_files = 0
-            self.state.total_files = 0
+            self.state.total_files = total
             self.state.percentage = 0.0
+            self._broadcast_internal()
+
+    def update(self, count: int = 1, current_file: str = ""):
+        """通用增量進度推進。"""
+        with self._lock:
+            self.state.processed_files += count
+            if current_file:
+                self.state.current_file = current_file
+            total = max(self.state.total_files, 1)
+            self.state.percentage = min(round((self.state.processed_files / total) * 100, 1), 99.0)
+            now = time.time()
+            elapsed = now - (self.state.started_at or now)
+            if elapsed > 0 and self.state.processed_files > 0:
+                speed = self.state.processed_files / elapsed
+                self.state.speed_fps = round(speed, 1)
+                remaining = max(total - self.state.processed_files, 0)
+                if speed > 0:
+                    self.state.eta_seconds = int(remaining / speed)
             self._broadcast_internal()
 
     def update_analyze_progress(self, processed: int, total: int, current_file: str = ""):

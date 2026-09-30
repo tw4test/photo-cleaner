@@ -70,8 +70,11 @@ export const AppShell = ({ children }: AppShellProps) => {
         {/* Footer info */}
         <div className="p-4 border-t border-slate-800 text-xs text-slate-500">
           <div className="flex items-center justify-between mb-1">
-            <span>運行模式</span>
-            <span className="text-amber-400 font-mono">Mock/Stub (無 GPU)</span>
+            <span>運算引擎</span>
+            <span className="text-emerald-400 font-mono flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+              PyTorch / OpenCV
+            </span>
           </div>
           <div className="flex items-center justify-between">
             <span>主機綁定</span>

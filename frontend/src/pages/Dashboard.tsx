@@ -7,7 +7,6 @@ import {
   Sparkles, 
   ArrowRight, 
   CheckCircle2, 
-  AlertCircle,
   RefreshCw,
   Smartphone,
   FileText,
@@ -216,10 +215,10 @@ export const Dashboard: React.FC = () => {
             </div>
           </div>
           <div className="flex items-start gap-3 p-4 bg-slate-950/60 rounded-xl border border-slate-800">
-            <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
             <div>
-              <div className="font-medium text-slate-200">AI 模組運行於 Mock 模式</div>
-              <div className="text-xs text-slate-500 mt-0.5">尚未載入 GPU 模型，使用虛擬特徵驗證流程</div>
+              <div className="font-medium text-slate-200">AI 語義模型與特徵管線已就緒</div>
+              <div className="text-xs text-slate-500 mt-0.5">本地 PyTorch (open_clip) + OpenCV 混合加速運算</div>
             </div>
           </div>
         </div>

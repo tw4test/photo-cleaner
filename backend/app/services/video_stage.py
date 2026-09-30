@@ -118,12 +118,20 @@ def run_video_stage(
         .all()
     )
 
+    total_videos = len(video_assets)
+    if progress_tracker:
+        progress_tracker.set_current_stage("video", total=total_videos)
+
     # 統計計數器
     processed = 0
     done = 0
     failed = 0
 
-    for asset in video_assets:
+    for idx, asset in enumerate(video_assets):
+        if progress_tracker and progress_tracker.is_cancel_requested():
+            logger.info("[video_stage] 收到使用者取消請求，提前停止")
+            break
+
         # 3. 確認實體檔案存在
         if not Path(asset.primary_path).exists():
             logger.debug(
@@ -131,6 +139,8 @@ def run_video_stage(
                 asset.id,
                 asset.primary_path,
             )
+            if progress_tracker:
+                progress_tracker.update_analyze_progress(idx + 1, total_videos, asset.primary_path)
             continue
 
         # 4. 判斷是否需要處理
@@ -142,7 +152,7 @@ def run_video_stage(
             # video_info 已存在，且不在重試清單中，跳過
             done += 1
             if progress_tracker:
-                progress_tracker.update(1)
+                progress_tracker.update_analyze_progress(idx + 1, total_videos, asset.primary_path)
             continue
 
         # 5. 呼叫 video_probe 取得容器資訊
@@ -193,7 +203,7 @@ def run_video_stage(
 
         finally:
             if progress_tracker:
-                progress_tracker.update(1)
+                progress_tracker.update_analyze_progress(idx + 1, total_videos, asset.primary_path)
 
     # 9. 統一提交
     session.commit()

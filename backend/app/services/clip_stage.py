@@ -140,6 +140,7 @@ def run_clip_stage(
     session,
     device: str = "auto",
     retry_failed: bool = False,
+    merge_with_basic: bool = False,
     progress_tracker=None,
 ) -> dict:
     """
@@ -161,7 +162,8 @@ def run_clip_stage(
         session:          SQLAlchemy 同步 Session。
         device:           運算裝置，'auto' | 'cuda' | 'cpu'。
         retry_failed:     若為 True，亦重新處理有失敗記錄的資產。
-        progress_tracker: 可選的進度追蹤物件（呼叫 .update(1) 推進進度）。
+        merge_with_basic: 若為 True，表示與 basic 階段同次執行，可合併解碼。
+        progress_tracker: 可選的進度追蹤物件。
 
     Returns:
         dict with keys:
@@ -199,13 +201,21 @@ def run_clip_stage(
         .all()
     )
 
+    total_assets = len(photo_raw_assets)
+    if progress_tracker:
+        progress_tracker.set_current_stage("clip", total=total_assets)
+
     # 統計計數器
     processed = 0
     done = 0
     stale_found = 0
     failed = 0
 
-    for asset in photo_raw_assets:
+    for idx, asset in enumerate(photo_raw_assets):
+        if progress_tracker and progress_tracker.is_cancel_requested():
+            logger.info("[clip_stage] 收到使用者取消請求，提前停止")
+            break
+
         # 5. 確認實體檔案存在
         if not Path(asset.primary_path).exists():
             logger.debug(
@@ -213,6 +223,8 @@ def run_clip_stage(
                 asset.id,
                 asset.primary_path,
             )
+            if progress_tracker:
+                progress_tracker.update_analyze_progress(idx + 1, total_assets, asset.primary_path)
             continue
 
         # 6. 判斷是否需要處理
@@ -231,7 +243,7 @@ def run_clip_stage(
             # 記錄已存在且為最新，跳過
             done += 1
             if progress_tracker:
-                progress_tracker.update(1)
+                progress_tracker.update_analyze_progress(idx + 1, total_assets, asset.primary_path)
             continue
 
         if is_stale:
@@ -294,7 +306,7 @@ def run_clip_stage(
 
         finally:
             if progress_tracker:
-                progress_tracker.update(1)
+                progress_tracker.update_analyze_progress(idx + 1, total_assets, asset.primary_path)
 
     # 10. 統一提交
     session.commit()
