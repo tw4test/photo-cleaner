@@ -220,12 +220,13 @@ class TestBasicStage:
             asset = session.query(Asset).first()
 
             # Create a fake thumbnail so _needs_processing returns False (thumbnail present)
-            import hashlib
-            from app.core.config import settings as cfg
-            sha = hashlib.sha256(asset.primary_path.encode()).hexdigest()
-            thumb_dir = cfg.THUMBS_CACHE_DIR / sha[:2]
-            thumb_dir.mkdir(parents=True, exist_ok=True)
-            (thumb_dir / f"{sha}.jpg").write_bytes(b"fake_thumb")
+            from app.services.thumbnail import thumbnail_service
+            primary_file = session.query(File).filter(File.asset_id == asset.id, File.role == "primary").first()
+            mtime_v = primary_file.mtime if primary_file else None
+            size_v = primary_file.size if primary_file else None
+            thumb_path = thumbnail_service.get_thumbnail_path(asset.primary_path, mtime=mtime_v, size=size_v)
+            thumb_path.parent.mkdir(parents=True, exist_ok=True)
+            thumb_path.write_bytes(b"fake_thumb")
 
             # Manually set a failed Feature record
             feat = Feature(
@@ -252,7 +253,7 @@ class TestBasicStage:
             assert result_retry["processed"] >= 1
 
             # Cleanup fake thumb
-            (thumb_dir / f"{sha}.jpg").unlink(missing_ok=True)
+            thumb_path.unlink(missing_ok=True)
             session.rollback()
 
 
@@ -280,9 +281,11 @@ class TestRebuildThumbs:
             phash_original = feat.phash
 
             # Delete the thumbnail
-            from app.core.config import settings as cfg
-            sha = hashlib.sha256(asset.primary_path.encode()).hexdigest()
-            thumb_path = cfg.THUMBS_CACHE_DIR / sha[:2] / f"{sha}.jpg"
+            from app.services.thumbnail import thumbnail_service
+            primary_file = session.query(File).filter(File.asset_id == asset.id, File.role == "primary").first()
+            mtime_v = primary_file.mtime if primary_file else None
+            size_v = primary_file.size if primary_file else None
+            thumb_path = thumbnail_service.get_thumbnail_path(asset.primary_path, mtime=mtime_v, size=size_v)
             if thumb_path.exists():
                 thumb_path.unlink()
 

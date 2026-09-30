@@ -1,13 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, update
+from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 import os
 
 from app.core.database import get_db, SyncSessionLocal
-from app.models.schema import Candidate, Asset, Feature, Group
+from app.models.schema import Candidate, Asset, Feature, Group, File
 from app.models.enums import CandidateState, CandidateRule
 from app.services.rules_engine import rules_engine
 
@@ -43,6 +44,7 @@ async def list_candidates(
 ):
     query = (
         select(Candidate, Asset)
+        .options(selectinload(Asset.files))
         .join(Asset, Candidate.asset_id == Asset.id)
         .where(Asset.status != "deleted")
     )
@@ -69,6 +71,20 @@ async def list_candidates(
     for cand, asset in rows:
         if asset.id not in grouped_by_asset:
             filename = os.path.basename(asset.primary_path)
+
+            mtime_val = 0
+            if asset.files:
+                for f in asset.files:
+                    if f.role == "primary":
+                        mtime_val = int(f.mtime)
+                        break
+                if not mtime_val and asset.files:
+                    mtime_val = int(asset.files[0].mtime)
+
+            thumb_url = f"/api/thumbnails/{asset.id}"
+            if mtime_val > 0:
+                thumb_url += f"?v={mtime_val}"
+
             grouped_by_asset[asset.id] = {
                 "id": cand.id,
                 "asset_id": asset.id,
@@ -84,7 +100,7 @@ async def list_candidates(
                 "group_id": cand.group_id,
                 "is_keeper": cand.is_keeper,
                 "state": cand.state,
-                "thumbnail_url": f"/api/thumbnails/{asset.id}"
+                "thumbnail_url": thumb_url
             }
         else:
             entry = grouped_by_asset[asset.id]

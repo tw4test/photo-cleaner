@@ -57,6 +57,38 @@ function getRuleBadge(rule: string) {
   }
 }
 
+const ReviewCardImage: React.FC<{ url: string; filename: string }> = ({ url, filename }) => {
+  const [loaded, setLoaded] = useState(false)
+  const [hasError, setHasError] = useState(false)
+
+  return (
+    <div className="relative w-full h-full flex items-center justify-center bg-slate-950">
+      {!loaded && !hasError && (
+        <div className="absolute inset-0 bg-slate-900/60 animate-pulse flex items-center justify-center">
+          <Sparkles className="w-5 h-5 text-slate-700 animate-spin" />
+        </div>
+      )}
+      {hasError ? (
+        <div className="flex flex-col items-center justify-center p-2 text-center text-slate-500">
+          <Camera className="w-6 h-6 text-slate-600 mb-1" />
+          <span className="text-[10px] text-slate-500 font-mono">預覽不可用</span>
+        </div>
+      ) : (
+        <img
+          src={url}
+          alt={filename}
+          loading="lazy"
+          onLoad={() => setLoaded(true)}
+          onError={() => setHasError(true)}
+          className={`w-full h-full object-cover group-hover:scale-105 transition-all duration-200 ${
+            loaded ? 'opacity-100' : 'opacity-0'
+          }`}
+        />
+      )}
+    </div>
+  )
+}
+
 export const Review: React.FC = () => {
   const navigate = useNavigate()
   const [items, setItems] = useState<CandidateItem[]>([])
@@ -492,14 +524,10 @@ export const Review: React.FC = () => {
                           {/* Top Section: Real Thumbnail Image */}
                           <div>
                             <div className="relative aspect-[4/3] bg-slate-950 rounded-xl overflow-hidden flex flex-col items-center justify-center border border-slate-800/80">
-                              <img
-                                src={item.thumbnail_url}
-                                alt={item.filename}
-                                loading="lazy"
-                                className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
-                                onError={(e) => {
-                                  (e.target as HTMLElement).style.display = 'none'
-                                }}
+                              <ReviewCardImage
+                                key={item.thumbnail_url}
+                                url={item.thumbnail_url}
+                                filename={item.filename}
                               />
 
                               {/* Media tag */}
@@ -532,14 +560,17 @@ export const Review: React.FC = () => {
                               )}
                             </div>
 
-                            {/* Filename & Size */}
+                            {/* Filename, Path & Size */}
                             <div className="mt-3 flex items-center justify-between text-xs gap-2">
-                              <span className="font-mono text-slate-200 truncate font-semibold" title={item.filename}>
+                              <span className="font-mono text-slate-200 truncate font-semibold" title={item.primary_path}>
                                 {item.filename}
                               </span>
                               <span className="text-slate-400 font-mono text-[11px] shrink-0">
                                 {formatBytes(item.size_total)}
                               </span>
+                            </div>
+                            <div className="text-[10px] text-slate-500 font-mono truncate mt-0.5" title={item.primary_path}>
+                              {item.primary_path}
                             </div>
                           </div>
 

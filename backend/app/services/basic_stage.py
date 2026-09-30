@@ -36,14 +36,26 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ─────────────────────────────────────────────
 
-def _thumb_exists(primary_path: str) -> bool:
+def _thumb_exists(asset: Asset) -> bool:
     """
-    Return True when the thumbnail for *primary_path* is already present in
-    the THUMBS_CACHE_DIR.  Mirrors the naming scheme used by ThumbnailService.
+    Return True when the thumbnail for *asset* is already present in
+    the THUMBS_CACHE_DIR, using content/metadata aware cache key.
     """
-    sha = hashlib.sha256(primary_path.encode()).hexdigest()
-    thumb_path = settings.THUMBS_CACHE_DIR / sha[:2] / f"{sha}.jpg"
-    return thumb_path.exists()
+    primary_file = None
+    if asset.files:
+        for f in asset.files:
+            if f.role == "primary":
+                primary_file = f
+                break
+    mtime = primary_file.mtime if primary_file else None
+    size = primary_file.size if primary_file else None
+    companion = asset.paired_paths[0] if (asset.paired_paths and len(asset.paired_paths) > 0) else None
+    return thumbnail_service.has_thumbnail(
+        file_path=asset.primary_path,
+        mtime=mtime,
+        size=size,
+        companion_path=companion
+    )
 
 
 def _upsert_failure(session: Session, asset_id: int, stage: str, msg: str) -> None:
@@ -66,7 +78,7 @@ def _needs_processing(asset: Asset, retry_failed: bool) -> bool:
 
     An asset needs processing when ANY of:
     - It has no Feature record yet.
-    - Its thumbnail is absent from the cache (may have been purged).
+    - Its thumbnail is absent from the cache (may have been purged or modified).
     - retry_failed=True AND features.decode_status == 'error'.
     """
     feat: Optional[Feature] = asset.features
@@ -76,7 +88,7 @@ def _needs_processing(asset: Asset, retry_failed: bool) -> bool:
         return True
 
     # Thumbnail missing on disk
-    if not _thumb_exists(asset.primary_path):
+    if not _thumb_exists(asset):
         return True
 
     # Errored decode and caller wants a retry
@@ -152,7 +164,22 @@ def run_basic_stage(
 
         try:
             # ── 1. Generate / refresh thumbnail ──────────────────────────────
-            thumbnail_service.generate_thumbnail(primary_path)
+            primary_file = None
+            if asset.files:
+                for f in asset.files:
+                    if f.role == "primary":
+                        primary_file = f
+                        break
+            mtime_v = primary_file.mtime if primary_file else None
+            size_v = primary_file.size if primary_file else None
+            companion_v = asset.paired_paths[0] if (asset.paired_paths and len(asset.paired_paths) > 0) else None
+
+            thumbnail_service.generate_thumbnail(
+                file_path=primary_path,
+                companion_path=companion_v,
+                mtime=mtime_v,
+                size=size_v
+            )
 
             # ── 2. Extract basic features ─────────────────────────────────────
             feats = feature_pipeline.extract_basic(primary_path, is_raw=is_raw)
@@ -246,7 +273,7 @@ def run_rebuild_thumbs_only(
 
     candidates_for_rebuild = [
         a for a in assets
-        if a.features is not None and not _thumb_exists(a.primary_path)
+        if a.features is not None and not _thumb_exists(a)
     ]
 
     total = len(candidates_for_rebuild)
@@ -261,7 +288,22 @@ def run_rebuild_thumbs_only(
             break
         stats["processed"] += 1
         try:
-            thumbnail_service.generate_thumbnail(asset.primary_path)
+            primary_file = None
+            if asset.files:
+                for f in asset.files:
+                    if f.role == "primary":
+                        primary_file = f
+                        break
+            mtime_v = primary_file.mtime if primary_file else None
+            size_v = primary_file.size if primary_file else None
+            companion_v = asset.paired_paths[0] if (asset.paired_paths and len(asset.paired_paths) > 0) else None
+
+            thumbnail_service.generate_thumbnail(
+                file_path=asset.primary_path,
+                companion_path=companion_v,
+                mtime=mtime_v,
+                size=size_v
+            )
             stats["done"] += 1
         except Exception as exc:
             logger.warning("rebuild_thumbs: failed for %s — %s", asset.primary_path, exc)

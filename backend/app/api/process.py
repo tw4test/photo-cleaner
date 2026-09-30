@@ -33,11 +33,14 @@ class ExecuteDeletionRequest(BaseModel):
     mode: str = "trash"  # "trash" | "permanent"
     confirmed: bool = False
 
+from sqlalchemy.orm import selectinload
+
 @router.get("/summary", response_model=QueuedSummaryResponse)
 async def get_queued_summary(db: AsyncSession = Depends(get_db)):
     # 查詢所有處於 queued 狀態的資產
     query = (
         select(Asset, Candidate)
+        .options(selectinload(Asset.files))
         .outerjoin(Candidate, Candidate.asset_id == Asset.id)
         .where(Asset.status == AssetStatus.QUEUED.value)
     )
@@ -55,6 +58,19 @@ async def get_queued_summary(db: AsyncSession = Depends(get_db)):
         total_size += asset.size_total
 
         filename = os.path.basename(asset.primary_path)
+        mtime_val = 0
+        if asset.files:
+            for f in asset.files:
+                if f.role == "primary":
+                    mtime_val = int(f.mtime)
+                    break
+            if not mtime_val and asset.files:
+                mtime_val = int(asset.files[0].mtime)
+
+        thumb_url = f"/api/thumbnails/{asset.id}"
+        if mtime_val > 0:
+            thumb_url += f"?v={mtime_val}"
+
         items.append(QueuedItemResponse(
             asset_id=asset.id,
             filename=filename,
@@ -64,7 +80,7 @@ async def get_queued_summary(db: AsyncSession = Depends(get_db)):
             paired_paths=asset.paired_paths or [],
             rule=cand.rule if cand else None,
             reason=cand.reason if cand else None,
-            thumbnail_url=f"/api/thumbnails/{asset.id}"
+            thumbnail_url=thumb_url
         ))
 
     return QueuedSummaryResponse(
