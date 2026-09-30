@@ -88,7 +88,7 @@ export const Dashboard: React.FC = () => {
               {stats?.candidates.total ?? 0}
             </div>
             <div className="text-xs text-slate-500 mt-1">
-              AI 語義雜圖 {(stats?.candidates.screenshot ?? 0) + (stats?.candidates.document ?? 0) + (stats?.candidates.meme ?? 0) + (stats?.candidates.mistouch ?? 0)} ｜ 重複/模糊 {(stats?.candidates.exact_dup ?? 0) + (stats?.candidates.near_dup ?? 0) + (stats?.candidates.blur ?? 0)}
+              共 {stats?.candidates.total ?? 0} 張待清理相片 ｜ 分類命中：AI 語義 {(stats?.candidates.screenshot ?? 0) + (stats?.candidates.document ?? 0) + (stats?.candidates.meme ?? 0) + (stats?.candidates.mistouch ?? 0)}，重複/模糊 {(stats?.candidates.exact_dup ?? 0) + (stats?.candidates.near_dup ?? 0) + (stats?.candidates.blur ?? 0)}
             </div>
           </div>
         </div>

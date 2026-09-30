@@ -80,5 +80,24 @@ def test_rules_engine_and_candidates():
         assert batch_data["protected_count"] == 1
         assert batch_data["updated_count"] == 1
 
+        # Test Strict Multi-Batch Keeper Protection:
+        # Now that the non-keeper is already queued, try to queue ONLY the keeper in a second batch
+        keeper_ids = [k["id"] for k in keepers]
+        batch_res2 = client.post("/api/candidates/batch-status", json={
+            "candidate_ids": keeper_ids,
+            "state": "queued"
+        })
+        assert batch_res2.status_code == 200
+        batch_data2 = batch_res2.json()
+        # The keeper MUST still be protected because the other group member is already in queued!
+        assert batch_data2["protected_count"] == 1
+        assert batch_data2["updated_count"] == 0
+
+        # Verify candidate item response has 'rules' and 'reasons' list
+        for c in candidates:
+            assert isinstance(c["rules"], list)
+            assert len(c["rules"]) >= 1
+            assert isinstance(c["reasons"], list)
+
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

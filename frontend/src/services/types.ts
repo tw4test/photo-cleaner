@@ -101,7 +101,9 @@ export interface CandidateItem {
   media_type: 'photo' | 'raw' | 'video'
   size_total: number
   rule: string
+  rules?: string[]
   reason: string
+  reasons?: string[]
   score: number
   group_id: number | null
   is_keeper: boolean

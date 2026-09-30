@@ -21,7 +21,9 @@ class CandidateItemResponse(BaseModel):
     media_type: str
     size_total: int
     rule: str
+    rules: List[str] = []
     reason: str
+    reasons: List[str] = []
     score: float
     group_id: Optional[int] = None
     is_keeper: bool
@@ -61,25 +63,46 @@ async def list_candidates(
     result = await db.execute(query)
     rows = result.all()
 
-    candidates_list = []
-    for cand, asset in rows:
-        filename = os.path.basename(asset.primary_path)
-        candidates_list.append(CandidateItemResponse(
-            id=cand.id,
-            asset_id=asset.id,
-            filename=filename,
-            primary_path=asset.primary_path,
-            media_type=asset.media_type,
-            size_total=asset.size_total,
-            rule=cand.rule,
-            reason=cand.reason,
-            score=cand.score,
-            group_id=cand.group_id,
-            is_keeper=cand.is_keeper,
-            state=cand.state,
-            thumbnail_url=f"/api/thumbnails/{asset.id}"
-        ))
+    # 以 Asset.id 為單位聚合，避免同一相片因命中多個規則而重複顯示多張卡片
+    grouped_by_asset: dict[int, dict] = {}
 
+    for cand, asset in rows:
+        if asset.id not in grouped_by_asset:
+            filename = os.path.basename(asset.primary_path)
+            grouped_by_asset[asset.id] = {
+                "id": cand.id,
+                "asset_id": asset.id,
+                "filename": filename,
+                "primary_path": asset.primary_path,
+                "media_type": asset.media_type,
+                "size_total": asset.size_total,
+                "rule": cand.rule,
+                "rules": [cand.rule],
+                "reason": cand.reason,
+                "reasons": [cand.reason],
+                "score": cand.score,
+                "group_id": cand.group_id,
+                "is_keeper": cand.is_keeper,
+                "state": cand.state,
+                "thumbnail_url": f"/api/thumbnails/{asset.id}"
+            }
+        else:
+            entry = grouped_by_asset[asset.id]
+            if cand.rule not in entry["rules"]:
+                entry["rules"].append(cand.rule)
+            if cand.reason not in entry["reasons"]:
+                entry["reasons"].append(cand.reason)
+            if cand.score > entry["score"]:
+                entry["score"] = cand.score
+                entry["rule"] = cand.rule
+                entry["reason"] = cand.reason
+                entry["id"] = cand.id
+            if cand.group_id and not entry["group_id"]:
+                entry["group_id"] = cand.group_id
+            if cand.is_keeper:
+                entry["is_keeper"] = True
+
+    candidates_list = [CandidateItemResponse(**v) for v in grouped_by_asset.values()]
     return candidates_list
 
 @router.post("/batch-status")
@@ -96,25 +119,35 @@ async def batch_update_status(
         if payload.state == "queued":
             target_ids = rules_engine.ensure_keeper_protection(sync_session, payload.candidate_ids)
 
-        # 更新 Candidate state
-        sync_session.query(Candidate).filter(Candidate.id.in_(target_ids)).update(
-            {"state": payload.state}, synchronize_session=False
-        )
+        if target_ids:
+            # 取得受影響的資產 ID
+            asset_ids = [
+                r[0] for r in sync_session.query(Candidate.asset_id)
+                .filter(Candidate.id.in_(target_ids))
+                .distinct()
+                .all()
+            ]
 
-        # 同步更新 Asset status
-        asset_status = "queued" if payload.state == "queued" else "kept" if payload.state == "kept" else "candidate"
-        asset_ids_subquery = sync_session.query(Candidate.asset_id).filter(Candidate.id.in_(target_ids))
-        sync_session.query(Asset).filter(Asset.id.in_(asset_ids_subquery)).update(
-            {"status": asset_status}, synchronize_session=False
-        )
+            # 更新這些資產的所有 Candidate 記錄狀態
+            sync_session.query(Candidate).filter(Candidate.asset_id.in_(asset_ids)).update(
+                {"state": payload.state}, synchronize_session=False
+            )
 
-        sync_session.commit()
+            # 同步更新 Asset status
+            asset_status = "queued" if payload.state == "queued" else "kept" if payload.state == "kept" else "candidate"
+            sync_session.query(Asset).filter(Asset.id.in_(asset_ids)).update(
+                {"status": asset_status}, synchronize_session=False
+            )
+
+            sync_session.commit()
+
+        protected_count = len(payload.candidate_ids) - len(target_ids)
 
     return {
         "status": "ok",
         "updated_count": len(target_ids),
         "target_state": payload.state,
-        "protected_count": len(payload.candidate_ids) - len(target_ids)
+        "protected_count": protected_count
     }
 
 @router.post("/evaluate")

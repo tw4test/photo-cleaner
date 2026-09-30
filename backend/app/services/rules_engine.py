@@ -406,18 +406,36 @@ class RulesEngine:
                         break
 
     def ensure_keeper_protection(self, session: Session, candidate_ids_to_queue: List[int]) -> List[int]:
-        """【鐵則 3：保留最後一張保護】"""
+        """
+        【鐵則 3：保留最後一張保護 - 嚴格防禦】
+        任何重複群組（exact_dup, near_dup）至少必須保留 1 張相片。
+        若本次操作或先前操作會導致整個群組全部進入待刪，Keeper 絕對禁止加入待刪。
+        """
         candidates = session.query(Candidate).filter(Candidate.id.in_(candidate_ids_to_queue)).all()
+        candidate_id_set = set(candidate_ids_to_queue)
+        asset_id_set = {c.asset_id for c in candidates}
         safe_candidate_ids = []
+
         for c in candidates:
-            if c.is_keeper:
+            if c.is_keeper and c.group_id:
+                # 查詢同組的所有其他成員
                 other_members = session.query(Candidate).filter(
                     Candidate.group_id == c.group_id,
-                    Candidate.id != c.id
+                    Candidate.asset_id != c.asset_id
                 ).all()
-                all_others_queued = all(m.id in candidate_ids_to_queue for m in other_members)
-                if all_others_queued:
+
+                # 檢查同組其他成員是否已經在 queued 狀態，或本次同時要被加入 queued
+                all_others_will_be_queued = all(
+                    (m.state == CandidateState.QUEUED.value)
+                    or (m.id in candidate_id_set)
+                    or (m.asset_id in asset_id_set)
+                    for m in other_members
+                )
+
+                # 若全部其他成員都被待刪，此 Keeper 為唯一的保留相片，嚴格禁止加入待刪
+                if all_others_will_be_queued and len(other_members) > 0:
                     continue
+
             safe_candidate_ids.append(c.id)
 
         return safe_candidate_ids
