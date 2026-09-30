@@ -88,7 +88,14 @@ class RealClipExtractor:
         """
         if requested == "cuda":
             if not self.cuda_available:
-                raise RuntimeError("CUDA 不可用：請選擇 CPU 或自動模式。目前系統無法使用 GPU。")
+                from app.services.cuda_manager import cuda_manager
+                hw = cuda_manager.get_cuda_status()
+                if hw.get("has_nvidia_gpu"):
+                    raise RuntimeError(
+                        f"偵測到您的電腦配備 {hw.get('gpu_name')}，但目前環境為 CPU 版 PyTorch。"
+                        "請在介面點擊「一鍵啟用 GPU 加速」下載安裝 CUDA 套件，或改選「自動」/「CPU」模式。"
+                    )
+                raise RuntimeError("本機未檢測到相容的 NVIDIA GPU，無法強制使用 CUDA 模式。請選擇 CPU 或自動模式。")
             return "cuda"
         elif requested == "auto":
             return "cuda" if self.cuda_available else "cpu"

@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import init_db
 from app.api import roots, scan, thumbnails, dashboard, candidates, process, history, settings as app_settings
-from app.api import jobs, analysis
+from app.api import jobs, analysis, system
+from app.services.cuda_manager import cuda_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,9 +47,11 @@ app.include_router(app_settings.router)
 # New routers (post scan/analysis split)
 app.include_router(jobs.router)
 app.include_router(analysis.router)
+app.include_router(system.router)
 
 @app.get("/api/health")
 async def health_check():
+    gpu_info = cuda_manager.get_cuda_status()
     return {
         "status": "ok",
         "app": settings.APP_NAME,
@@ -56,4 +59,10 @@ async def health_check():
         "host": settings.HOST,
         "port": settings.PORT,
         "gpu_mode": "mock_stub",
+        "gpu": {
+            "name": gpu_info.get("gpu_name"),
+            "has_nvidia": gpu_info.get("has_nvidia_gpu"),
+            "cuda_available": gpu_info.get("torch_cuda_available"),
+            "torch_version": gpu_info.get("torch_version"),
+        }
     }

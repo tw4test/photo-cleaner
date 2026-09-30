@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import { 
   Cpu, 
   Sparkles, 
@@ -9,9 +9,12 @@ import {
   AlertTriangle, 
   Play, 
   RotateCcw,
-  Zap
+  Zap,
+  ShieldCheck
 } from 'lucide-react'
-import { AnalysisStatus } from '../../services/types'
+import { AnalysisStatus, GpuDiagnosticStatus } from '../../services/types'
+import { api } from '../../services/api'
+import { CudaInstallModal } from '../common/CudaInstallModal'
 
 interface AnalysisPanelProps {
   status: AnalysisStatus | null
@@ -31,6 +34,36 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
   onRefreshStatus,
 }) => {
   const [device, setDevice] = useState<'auto' | 'cuda' | 'cpu'>('auto')
+  const [gpuStatus, setGpuStatus] = useState<GpuDiagnosticStatus | null>(null)
+  const [gpuLoading, setGpuLoading] = useState(false)
+  const [showCudaModal, setShowCudaModal] = useState(false)
+
+  const loadGpuStatus = useCallback(async (refresh = false) => {
+    try {
+      setGpuLoading(true)
+      const data = await api.getGpuStatus(refresh)
+      setGpuStatus(data)
+    } catch (err) {
+      console.error('Failed to load GPU status:', err)
+    } finally {
+      setGpuLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadGpuStatus()
+  }, [loadGpuStatus])
+
+  const handleRefreshAll = async () => {
+    await Promise.all([onRefreshStatus(), loadGpuStatus(true)])
+  }
+
+  const handleDeviceChange = (newDevice: 'auto' | 'cuda' | 'cpu') => {
+    if (newDevice === 'cuda' && gpuStatus?.has_nvidia_gpu && !gpuStatus.is_ready) {
+      setShowCudaModal(true)
+    }
+    setDevice(newDevice)
+  }
 
   const stagesInfo = [
     {
@@ -81,7 +114,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-800 pb-4">
         <div>
           <h3 className="text-lg font-bold text-slate-100 flex items-center gap-2">
             <Cpu className="w-5 h-5 text-purple-400" />
@@ -92,14 +125,40 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
           </p>
         </div>
 
-        {/* Device Switcher & Status Refresh */}
-        <div className="flex items-center gap-3">
+        {/* Hardware Status Badge & Device Switcher */}
+        <div className="flex items-center gap-2.5 flex-wrap">
+          {/* Dynamic GPU Status Badge */}
+          {gpuStatus?.is_ready ? (
+            <div className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-950/40 border border-emerald-800/60 rounded-xl text-xs text-emerald-400 font-mono">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+              <span>⚡ {gpuStatus.gpu_name} (CUDA 就緒)</span>
+            </div>
+          ) : gpuStatus?.has_nvidia_gpu ? (
+            <button
+              onClick={() => setShowCudaModal(true)}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-purple-900/60 to-indigo-900/60 hover:from-purple-800 hover:to-indigo-800 border border-purple-700/60 rounded-xl text-xs text-purple-200 font-medium transition-all shadow-md shadow-purple-900/30 cursor-pointer animate-pulse"
+              title="偵測到 NVIDIA 獨立顯卡，點擊一鍵下載安裝 PyTorch CUDA 12.1"
+            >
+              <Zap className="w-3.5 h-3.5 text-amber-300" />
+              <span>⚡ 偵測到 {gpuStatus.gpu_name}</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/30 text-white font-bold">
+                一鍵啟用 GPU 加速
+              </span>
+            </button>
+          ) : (
+            <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-400 font-mono">
+              <Cpu className="w-3.5 h-3.5 text-slate-500" />
+              <span>未檢測到相容 GPU (CPU 模式)</span>
+            </div>
+          )}
+
+          {/* Device Switcher */}
           <div className="flex items-center gap-1.5 bg-slate-950 px-2.5 py-1.5 rounded-xl border border-slate-800 text-xs">
             <span className="text-slate-500">運算裝置：</span>
             <select
               value={device}
-              onChange={(e) => setDevice(e.target.value as any)}
-              className="bg-slate-900 text-slate-200 rounded-lg px-2 py-0.5 border border-slate-700 text-xs font-medium focus:outline-none focus:border-purple-500"
+              onChange={(e) => handleDeviceChange(e.target.value as any)}
+              className="bg-slate-900 text-slate-200 rounded-lg px-2 py-0.5 border border-slate-700 text-xs font-medium focus:outline-none focus:border-purple-500 cursor-pointer"
             >
               <option value="auto">自動 (GPU優先)</option>
               <option value="cuda">只用 GPU (CUDA)</option>
@@ -108,11 +167,11 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
           </div>
 
           <button
-            onClick={onRefreshStatus}
-            className="p-2 text-slate-400 hover:text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-xl border border-slate-700 transition-colors"
-            title="重新整理統計"
+            onClick={handleRefreshAll}
+            className="p-2 text-slate-400 hover:text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-xl border border-slate-700 transition-colors cursor-pointer"
+            title="重新整理分析統計與硬體狀態"
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`w-3.5 h-3.5 ${loading || gpuLoading ? 'animate-spin' : ''}`} />
           </button>
         </div>
       </div>
@@ -241,6 +300,14 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
           )
         })}
       </div>
+
+      {/* CUDA Install Modal */}
+      <CudaInstallModal
+        isOpen={showCudaModal}
+        onClose={() => setShowCudaModal(false)}
+        gpuStatus={gpuStatus}
+        onRefreshGpuStatus={() => loadGpuStatus(true)}
+      />
     </div>
   )
 }

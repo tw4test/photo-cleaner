@@ -73,4 +73,12 @@ export const api = {
   updateSettings: (settings: Record<string, any>, reEvaluate: boolean = true) =>
     apiClient.put('/settings', { settings, re_evaluate: reEvaluate }).then(res => res.data),
   resetSettings: () => apiClient.post('/settings/reset').then(res => res.data),
+
+  // System & GPU Diagnostics / Installation
+  getGpuStatus: (refresh: boolean = false) =>
+    apiClient.get<import('./types').GpuDiagnosticStatus>('/system/gpu-status', { params: { refresh } }).then(res => res.data),
+  triggerInstallCuda: (variant: string = 'cu121') =>
+    apiClient.post('/system/install-cuda', { variant }).then(res => res.data),
+  cancelInstallCuda: () =>
+    apiClient.post('/system/install-cuda/cancel').then(res => res.data),
 }

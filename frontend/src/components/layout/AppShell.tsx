@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useState, useEffect } from 'react'
 import { NavLink } from 'react-router-dom'
 import { 
   LayoutDashboard, 
@@ -7,14 +7,24 @@ import {
   Trash2, 
   History as HistoryIcon,
   Sliders,
-  ShieldCheck
+  ShieldCheck,
+  Zap,
+  Cpu
 } from 'lucide-react'
+import { api } from '../../services/api'
+import { GpuDiagnosticStatus } from '../../services/types'
 
 export interface AppShellProps {
   children: React.ReactNode
 }
 
 export const AppShell = ({ children }: AppShellProps) => {
+  const [gpuStatus, setGpuStatus] = useState<GpuDiagnosticStatus | null>(null)
+
+  useEffect(() => {
+    api.getGpuStatus().then(setGpuStatus).catch(() => {})
+  }, [])
+
   const navItems = [
     { to: '/', label: '首頁總覽', icon: LayoutDashboard, exact: true },
     { to: '/library', label: '資料庫掃描', icon: FolderSync },
@@ -68,15 +78,32 @@ export const AppShell = ({ children }: AppShellProps) => {
         </div>
 
         {/* Footer info */}
-        <div className="p-4 border-t border-slate-800 text-xs text-slate-500">
-          <div className="flex items-center justify-between mb-1">
-            <span>運算引擎</span>
-            <span className="text-emerald-400 font-mono flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-              PyTorch / OpenCV
-            </span>
+        <div className="p-4 border-t border-slate-800 text-xs text-slate-500 space-y-2">
+          <div>
+            <div className="flex items-center justify-between mb-0.5">
+              <span>運算引擎</span>
+              {gpuStatus?.is_ready ? (
+                <span className="text-emerald-400 font-mono flex items-center gap-1">
+                  <Zap className="w-3 h-3 text-amber-300" />
+                  <span>GPU ({gpuStatus.torch_cuda_version || 'CUDA'})</span>
+                </span>
+              ) : gpuStatus?.has_nvidia_gpu ? (
+                <span className="text-purple-400 font-mono flex items-center gap-1">
+                  <Cpu className="w-3 h-3 text-purple-400" />
+                  <span>CPU (可升級 GPU)</span>
+                </span>
+              ) : (
+                <span className="text-slate-400 font-mono">PyTorch (CPU)</span>
+              )}
+            </div>
+            {gpuStatus?.has_nvidia_gpu && (
+              <div className="text-[10px] text-slate-500 truncate font-mono" title={gpuStatus.gpu_name}>
+                {gpuStatus.gpu_name}
+              </div>
+            )}
           </div>
-          <div className="flex items-center justify-between">
+
+          <div className="flex items-center justify-between pt-1 border-t border-slate-850">
             <span>主機綁定</span>
             <span className="text-slate-400 font-mono">127.0.0.1:8000</span>
           </div>

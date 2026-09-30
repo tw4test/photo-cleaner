@@ -35,6 +35,36 @@ export interface AnalysisStatus {
   device: string
 }
 
+export interface CudaInstallProgress {
+  status: 'idle' | 'downloading' | 'installing' | 'verifying' | 'success' | 'failed' | 'cancelled'
+  percentage: number
+  message: string
+  current_step?: string
+  downloaded_bytes?: number
+  total_bytes?: number
+  speed?: string
+  logs: string[]
+  error?: string | null
+  started_at?: number | null
+  finished_at?: number | null
+}
+
+export interface GpuDiagnosticStatus {
+  has_nvidia_gpu: boolean
+  gpu_name: string
+  driver_version: string
+  max_cuda_version: string
+  vram_mb: number
+  torch_version: string
+  torch_cuda_available: boolean
+  torch_cuda_version: string | null
+  is_ready: boolean
+  status_code: 'cuda_ready' | 'gpu_detected_need_cuda' | 'no_nvidia_gpu'
+  status_desc: string
+  recommended_variant: string
+  install_state: CudaInstallProgress
+}
+
 export interface AnalysisFailureItem {
   id: number
   asset_id: number
