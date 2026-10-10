@@ -253,17 +253,12 @@ def _clip_worker(
                     asset.id,
                 )
 
-            # 執行 CLIP 特徵提取
+            # 執行 CLIP 特徵提取（單次解碼 + 單次 forward 取得 embedding 與 zero-shot）
             try:
-                embedding: bytes = clip_extractor.extract_embedding(
-                    primary_path,
-                    model_name=current_model,
-                    pretrained=current_pretrained,
-                    device=device_used,
-                )
-                zs_scores: dict = clip_extractor.classify_zero_shot(
+                embedding, zs_scores = clip_extractor.extract_all(
                     primary_path,
                     _ZS_LABELS,
+                    is_raw=(asset.media_type == "raw"),
                     model_name=current_model,
                     pretrained=current_pretrained,
                     device=device_used,

@@ -194,6 +194,105 @@ class RealClipExtractor:
         self._text_features_cache[category_key] = mean_feature
         return mean_feature
 
+    def _open_image_safely(self, file_path: str, is_raw: bool = False) -> Image.Image:
+        """安全開啟影像，支援 RAW 格式內嵌縮圖優先解碼。"""
+        if is_raw:
+            try:
+                from app.stubs.raw_stub import raw_decoder
+                if raw_decoder.is_raw(file_path):
+                    raw_bytes = raw_decoder.decode_raw(file_path)
+                    if raw_bytes:
+                        img = Image.open(io.BytesIO(raw_bytes))
+                        return img.convert("RGB")
+            except Exception as e:
+                logger.debug(f"RAW decode for CLIP failed, falling back to PIL: {e}")
+
+        img = Image.open(file_path)
+        return img.convert("RGB")
+
+    def extract_all(
+        self,
+        file_path: str,
+        labels: List[str],
+        image: Optional[Image.Image] = None,
+        is_raw: bool = False,
+        model_name: str = "ViT-B-16",
+        pretrained: str = "openai",
+        device: str = "auto",
+    ) -> Tuple[bytes, Dict[str, float]]:
+        """
+        合併特徵提取與 Zero-Shot 分類：單次解碼、單次 forward、啟用 autocast。
+        回傳 (embedding_bytes, zs_scores)。
+        """
+        try:
+            import torch
+            self._load_model(model_name=model_name, pretrained=pretrained, device=device)
+            torch_device = torch.device(self._device_str)
+
+            if image is None:
+                image = self._open_image_safely(file_path, is_raw=is_raw)
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+
+            image_tensor = self._preprocess(image).unsqueeze(0).to(torch_device)
+            use_amp = (self._device_str == "cuda")
+
+            with torch.no_grad():
+                with torch.autocast(device_type=self._device_str, dtype=torch.float16, enabled=use_amp):
+                    image_features = self._model.encode_image(image_tensor)
+                    image_features /= image_features.norm(dim=-1, keepdim=True)
+
+                    # 1. 取得 Zero-Shot 分類結果（直接沿用剛算出的 image_features）
+                    category_keys = [LABEL_MAP.get(lbl, lbl) for lbl in labels]
+                    eval_keys = list(category_keys)
+                    has_normal = "normal_photo" in eval_keys
+                    if not has_normal:
+                        eval_keys.append("normal_photo")
+
+                    text_embeds_list = [self._get_text_features(k, torch_device) for k in eval_keys]
+                    text_matrix = torch.cat(text_embeds_list, dim=0)
+
+                    logit_scale = getattr(self._model, "logit_scale", torch.tensor(100.0)).exp()
+                    logits = logit_scale * (image_features @ text_matrix.T)
+                    probs = torch.softmax(logits, dim=-1).cpu().numpy().flatten()
+
+            # 2. 轉為 512 維 float32 bytes
+            vec_np = image_features.cpu().float().numpy().flatten().astype(np.float32)
+            embedding_bytes = vec_np.tobytes()
+
+            zs_results: Dict[str, float] = {}
+            for i, lbl in enumerate(labels):
+                zs_results[lbl] = round(float(probs[i]), 3)
+            if not has_normal:
+                zs_results["normal_photo"] = round(float(probs[-1]), 3)
+
+            return embedding_bytes, zs_results
+
+        except RuntimeError as e:
+            if "CUDA 不可用" in str(e):
+                raise
+            logger.warning(f"CLIP extract_all fallback for {file_path}: {e}")
+            seed = int(hashlib.sha256(file_path.encode('utf-8')).hexdigest()[:8], 16)
+            rng = np.random.default_rng(seed)
+            vec = rng.standard_normal(self.EMBEDDING_DIM, dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            zs_res = {lbl: 0.0 for lbl in labels}
+            zs_res["normal_photo"] = 1.0
+            return vec.tobytes(), zs_res
+        except Exception as e:
+            logger.warning(f"CLIP extract_all fallback for {file_path}: {e}")
+            seed = int(hashlib.sha256(file_path.encode('utf-8')).hexdigest()[:8], 16)
+            rng = np.random.default_rng(seed)
+            vec = rng.standard_normal(self.EMBEDDING_DIM, dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            zs_res = {lbl: 0.0 for lbl in labels}
+            zs_res["normal_photo"] = 1.0
+            return vec.tobytes(), zs_res
+
     def extract_embedding(
         self,
         file_path: str,
@@ -211,17 +310,19 @@ class RealClipExtractor:
             torch_device = torch.device(self._device_str)
 
             if image is None:
-                image = Image.open(file_path).convert("RGB")
+                image = self._open_image_safely(file_path)
             elif image.mode != "RGB":
                 image = image.convert("RGB")
 
             image_tensor = self._preprocess(image).unsqueeze(0).to(torch_device)
+            use_amp = (self._device_str == "cuda")
 
             with torch.no_grad():
-                image_features = self._model.encode_image(image_tensor)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
+                with torch.autocast(device_type=self._device_str, dtype=torch.float16, enabled=use_amp):
+                    image_features = self._model.encode_image(image_tensor)
+                    image_features /= image_features.norm(dim=-1, keepdim=True)
 
-            vec_np = image_features.cpu().numpy().flatten().astype(np.float32)
+            vec_np = image_features.cpu().float().numpy().flatten().astype(np.float32)
             return vec_np.tobytes()
         except RuntimeError as e:
             if "CUDA 不可用" in str(e):
@@ -263,15 +364,17 @@ class RealClipExtractor:
             torch_device = torch.device(self._device_str)
 
             if image is None:
-                image = Image.open(file_path).convert("RGB")
+                image = self._open_image_safely(file_path)
             elif image.mode != "RGB":
                 image = image.convert("RGB")
 
             image_tensor = self._preprocess(image).unsqueeze(0).to(torch_device)
+            use_amp = (self._device_str == "cuda")
 
             with torch.no_grad():
-                image_feature = self._model.encode_image(image_tensor)
-                image_feature /= image_feature.norm(dim=-1, keepdim=True)
+                with torch.autocast(device_type=self._device_str, dtype=torch.float16, enabled=use_amp):
+                    image_feature = self._model.encode_image(image_tensor)
+                    image_feature /= image_feature.norm(dim=-1, keepdim=True)
 
                 category_keys = [LABEL_MAP.get(lbl, lbl) for lbl in labels]
                 eval_keys = list(category_keys)
