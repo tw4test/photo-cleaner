@@ -69,130 +69,14 @@ async def get_analysis_status(db: AsyncSession = Depends(get_db)):
     clip_model, clip_pretrained = await _get_clip_settings(db)
     device = await _get_compute_device(db)
 
-    # ── hash 階段統計 ────────────────────────────────────────────────────────────
-    # 只統計主檔（role='primary'）
-    hash_counts_q = await db.execute(
-        select(File.hash_state, func.count(File.id))
-        .join(Asset, File.asset_id == Asset.id)
-        .where(File.role == "primary")
-        .where(Asset.status.notin_(["deleted", "missing"]))
-        .group_by(File.hash_state)
-    )
-    hash_counts = {row[0]: row[1] for row in hash_counts_q.all()}
-
-    hash_stats = {
-        "pending": hash_counts.get("pending", 0),
-        "done": hash_counts.get("done", 0),
-        "not_needed": hash_counts.get("not_needed", 0),
-        "failed": hash_counts.get("error", 0),
-    }
-
-    # ── basic 階段統計 ────────────────────────────────────────────────────────────
-    # 適用對象：photo / raw
-    total_photo_raw_q = await db.execute(
-        select(func.count(Asset.id))
-        .where(Asset.media_type.in_(["photo", "raw"]))
-        .where(Asset.status.notin_(["deleted", "missing"]))
-    )
-    total_photo_raw = total_photo_raw_q.scalar() or 0
-
-    basic_done_q = await db.execute(
-        select(func.count(Feature.asset_id))
-        .join(Asset, Feature.asset_id == Asset.id)
-        .where(Feature.decode_status == "ok")
-        .where(Feature.analyzed_at.is_not(None))
-        .where(Asset.status.notin_(["deleted", "missing"]))
-    )
-    basic_done = basic_done_q.scalar() or 0
-
-    basic_failed_q = await db.execute(
-        select(func.count(AnalysisFailure.id))
-        .join(Asset, AnalysisFailure.asset_id == Asset.id)
-        .where(AnalysisFailure.stage == "basic")
-        .where(Asset.status.notin_(["deleted", "missing"]))
-    )
-    basic_failed = basic_failed_q.scalar() or 0
-    basic_pending = max(total_photo_raw - basic_done - basic_failed, 0)
-
-    basic_stats = {
-        "pending": basic_pending,
-        "done": basic_done,
-        "failed": basic_failed,
-    }
-
-    # ── clip 階段統計 ─────────────────────────────────────────────────────────────
-    # done = clip_features 存在且 model/pretrained 相符
-    # stale = clip_features 存在但 model/pretrained 不符
-    # pending = 無 clip_features 記錄
-    # failed = analysis_failures stage='clip'
-
-    clip_done_q = await db.execute(
-        select(func.count(ClipFeature.asset_id))
-        .join(Asset, ClipFeature.asset_id == Asset.id)
-        .where(ClipFeature.model == clip_model)
-        .where(ClipFeature.pretrained == clip_pretrained)
-        .where(Asset.status.notin_(["deleted", "missing"]))
-        .where(Asset.media_type.in_(["photo", "raw"]))
-    )
-    clip_done = clip_done_q.scalar() or 0
-
-    clip_stale_q = await db.execute(
-        select(func.count(ClipFeature.asset_id))
-        .join(Asset, ClipFeature.asset_id == Asset.id)
-        .where(
-            (ClipFeature.model != clip_model) |
-            (ClipFeature.pretrained != clip_pretrained)
+    from app.core.database import SyncSessionLocal
+    from app.services.stats_service import stats_service
+    with SyncSessionLocal() as session:
+        stages_stats = stats_service.get_analysis_stage_stats(
+            session=session,
+            clip_model=clip_model,
+            clip_pretrained=clip_pretrained,
         )
-        .where(Asset.status.notin_(["deleted", "missing"]))
-        .where(Asset.media_type.in_(["photo", "raw"]))
-    )
-    clip_stale = clip_stale_q.scalar() or 0
-
-    clip_failed_q = await db.execute(
-        select(func.count(AnalysisFailure.id))
-        .join(Asset, AnalysisFailure.asset_id == Asset.id)
-        .where(AnalysisFailure.stage == "clip")
-        .where(Asset.status.notin_(["deleted", "missing"]))
-    )
-    clip_failed = clip_failed_q.scalar() or 0
-    clip_pending = max(total_photo_raw - clip_done - clip_stale - clip_failed, 0)
-
-    clip_stats = {
-        "pending": clip_pending,
-        "done": clip_done,
-        "stale": clip_stale,
-        "failed": clip_failed,
-    }
-
-    # ── video 階段統計 ────────────────────────────────────────────────────────────
-    total_video_q = await db.execute(
-        select(func.count(Asset.id))
-        .where(Asset.media_type == "video")
-        .where(Asset.status.notin_(["deleted", "missing"]))
-    )
-    total_video = total_video_q.scalar() or 0
-
-    video_done_q = await db.execute(
-        select(func.count(VideoInfo.asset_id))
-        .join(Asset, VideoInfo.asset_id == Asset.id)
-        .where(Asset.status.notin_(["deleted", "missing"]))
-    )
-    video_done = video_done_q.scalar() or 0
-
-    video_failed_q = await db.execute(
-        select(func.count(AnalysisFailure.id))
-        .join(Asset, AnalysisFailure.asset_id == Asset.id)
-        .where(AnalysisFailure.stage == "video")
-        .where(Asset.status.notin_(["deleted", "missing"]))
-    )
-    video_failed = video_failed_q.scalar() or 0
-    video_pending = max(total_video - video_done - video_failed, 0)
-
-    video_stats = {
-        "pending": video_pending,
-        "done": video_done,
-        "failed": video_failed,
-    }
 
     # ── runners 設定 ────────────────────────────────────────────────────────────
     runners_data = {}
@@ -209,12 +93,7 @@ async def get_analysis_status(db: AsyncSession = Depends(get_db)):
             runners_data[stage_key] = default_val
 
     return {
-        "stages": {
-            "hash": hash_stats,
-            "basic": basic_stats,
-            "clip": clip_stats,
-            "video": video_stats,
-        },
+        "stages": stages_stats,
         "clip_model": clip_model,
         "clip_pretrained": clip_pretrained,
         "device": device,

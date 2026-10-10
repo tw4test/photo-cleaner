@@ -8,6 +8,7 @@ Does NOT read image content and does NOT call any feature extraction.
 """
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,9 @@ from app.services.pairing import pairing_engine
 from app.services.scanner import scan_directory
 
 logger = logging.getLogger(__name__)
+
+# Concurrency lock to prevent simultaneous scans from colliding on unique asset paths
+_SCAN_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -116,180 +120,195 @@ def run_scan_job(
     if mode not in ("full", "new_only"):
         raise ValueError(f"Unknown scan mode: {mode!r}. Expected 'full' or 'new_only'.")
 
-    summary = ScanSummary()
-
-    # ------------------------------------------------------------------
-    # 1. Resolve which roots to scan
-    # ------------------------------------------------------------------
-    query = session.query(Root)
-    if root_ids:
-        query = query.filter(Root.id.in_(root_ids))
-    roots: list[Root] = query.all()
-
-    if not roots:
-        logger.warning("run_scan_job: no roots found for root_ids=%s", root_ids)
-        return summary
-
-    # ------------------------------------------------------------------
-    # 2. Announce discovery phase to the progress tracker (if present)
-    # ------------------------------------------------------------------
-    # (progress_tracker.start_scan() is called by the background task in scan.py / jobs.py)
-    for root in roots:
-        logger.info("Scanning root id=%d path=%r mode=%s", root.id, root.path, mode)
+    with _SCAN_LOCK:
+        summary = ScanSummary()
 
         # ------------------------------------------------------------------
-        # 2a. Offline-root check: mark unavailable and skip
+        # 1. Resolve which roots to scan
         # ------------------------------------------------------------------
-        root_path = Path(root.path)
-        if not root_path.exists() or not root_path.is_dir():
-            logger.warning("Root id=%d path=%r is offline – marking unavailable.", root.id, root.path)
-            root.available = False
-            # Persist the unavailability flag but leave existing assets untouched.
-            session.flush()
-            continue
+        query = session.query(Root)
+        if root_ids:
+            query = query.filter(Root.id.in_(root_ids))
+        roots: list[Root] = query.all()
 
-        # Root is reachable – ensure the available flag is set to True.
-        root.available = True
+        if not roots:
+            logger.warning("run_scan_job: no roots found for root_ids=%s", root_ids)
+            return summary
 
         # ------------------------------------------------------------------
-        # 3. Discover files on disk
+        # 2. Announce discovery phase to the progress tracker (if present)
         # ------------------------------------------------------------------
-        scanned_raw: list[dict] = list(
-            scan_directory(
-                root_path=root.path,
-                recursive=root.recursive,
-                exclude_patterns=root.exclude_patterns or "",
+        # (progress_tracker.start_scan() is called by the background task in scan.py / jobs.py)
+        for root in roots:
+            logger.info("Scanning root id=%d path=%r mode=%s", root.id, root.path, mode)
+
+            # ------------------------------------------------------------------
+            # 2a. Offline-root check: mark unavailable and skip
+            # ------------------------------------------------------------------
+            root_path = Path(root.path)
+            if not root_path.exists() or not root_path.is_dir():
+                logger.warning("Root id=%d path=%r is offline – marking unavailable.", root.id, root.path)
+                root.available = False
+                # Persist the unavailability flag but leave existing assets untouched.
+                session.flush()
+                continue
+
+            # Root is reachable – ensure the available flag is set to True.
+            root.available = True
+
+            # ------------------------------------------------------------------
+            # 3. Discover files on disk
+            # ------------------------------------------------------------------
+            scanned_raw: list[dict] = list(
+                scan_directory(
+                    root_path=root.path,
+                    recursive=root.recursive,
+                    exclude_patterns=root.exclude_patterns or "",
+                )
             )
-        )
-        logger.debug("Root id=%d: %d files discovered on disk.", root.id, len(scanned_raw))
+            logger.debug("Root id=%d: %d files discovered on disk.", root.id, len(scanned_raw))
 
-        # ------------------------------------------------------------------
-        # 4. Pair files (RAW+JPG, Live Photo, sidecar)
-        # ------------------------------------------------------------------
-        paired_assets: list[dict] = pairing_engine.pair_files(scanned_raw)
-        total_assets = len(paired_assets)
+            # ------------------------------------------------------------------
+            # 4. Pair files (RAW+JPG, Live Photo, sidecar)
+            # ------------------------------------------------------------------
+            paired_assets: list[dict] = pairing_engine.pair_files(scanned_raw)
+            total_assets = len(paired_assets)
 
-        if progress_tracker is not None:
-            progress_tracker.set_discovered_total(total_assets)
+            if progress_tracker is not None:
+                progress_tracker.set_discovered_total(total_assets)
 
-        # Collect the primary paths of every asset seen on disk (used later
-        # for missing-asset detection in full mode).
-        scanned_primary_paths: set[str] = set()
+            # Collect the primary paths of every asset seen on disk (used later
+            # for missing-asset detection in full mode).
+            scanned_primary_paths: set[str] = set()
 
-        # ------------------------------------------------------------------
-        # 5. Build an in-memory lookup of existing DB assets for this root
-        #    keyed by primary_path to avoid repeated per-asset DB queries.
-        # ------------------------------------------------------------------
-        existing_assets: dict[str, Asset] = {
-            a.primary_path: a
-            for a in session.query(Asset).filter(Asset.root_id == root.id).all()
-        }
+            # ------------------------------------------------------------------
+            # 5. Build an in-memory lookup of existing DB assets for this root
+            #    keyed by primary_path to avoid repeated per-asset DB queries.
+            # ------------------------------------------------------------------
+            existing_assets: dict[str, Asset] = {
+                a.primary_path: a
+                for a in session.query(Asset).filter(Asset.root_id == root.id).all()
+            }
 
-        # Track existing File rows by path for quick lookup
-        existing_files: dict[str, File] = {
-            f.path: f
-            for f in session.query(File)
-            .join(Asset)
-            .filter(Asset.root_id == root.id)
-            .all()
-        }
+            # Track existing File rows by path for quick lookup
+            existing_files: dict[str, File] = {
+                f.path: f
+                for f in session.query(File)
+                .join(Asset)
+                .filter(Asset.root_id == root.id)
+                .all()
+            }
 
-        # ------------------------------------------------------------------
-        # 6. Process each paired asset
-        # ------------------------------------------------------------------
-        processed_count = 0
+            # ------------------------------------------------------------------
+            # 6. Process each paired asset
+            # ------------------------------------------------------------------
+            processed_count = 0
 
-        for paired in paired_assets:
-            primary_info: dict = paired["primary_file"]
-            paired_infos: list[dict] = paired["paired_files"]
-            media_type: str = paired["media_type"]
-            size_total: int = paired["size_total"]
+            for paired in paired_assets:
+                primary_info: dict = paired["primary_file"]
+                paired_infos: list[dict] = paired["paired_files"]
+                media_type: str = paired["media_type"]
+                size_total: int = paired["size_total"]
 
-            primary_path: str = primary_info["path"]
-            scanned_primary_paths.add(primary_path)
+                primary_path: str = primary_info["path"]
+                scanned_primary_paths.add(primary_path)
 
-            # Check for cancellation if the tracker supports it
-            if progress_tracker is not None and progress_tracker.is_cancel_requested():
-                logger.info("Scan cancelled by user at root id=%d.", root.id)
-                return summary
+                # Check for cancellation if the tracker supports it
+                if progress_tracker is not None and progress_tracker.is_cancel_requested():
+                    logger.info("Scan cancelled by user at root id=%d.", root.id)
+                    return summary
 
-            existing_asset: Optional[Asset] = existing_assets.get(primary_path)
+                existing_asset: Optional[Asset] = existing_assets.get(primary_path)
+                if existing_asset is None:
+                    # Fallback check across all roots or reviving assets previously in DB
+                    existing_asset = session.query(Asset).filter(Asset.primary_path == primary_path).first()
+                    if existing_asset is not None:
+                        existing_assets[primary_path] = existing_asset
+                        # Ensure root_id is updated if root was re-added
+                        existing_asset.root_id = root.id
 
-            if existing_asset is not None:
-                # --------------------------------------------------------
-                # Path already known – decide what to do
-                # --------------------------------------------------------
-                if mode == "new_only":
-                    # Skip entirely in new_only mode.
-                    summary.unchanged += 1
-                else:
-                    # full mode: check whether the primary file has changed.
-                    primary_file_row: Optional[File] = existing_files.get(primary_path)
-
-                    if primary_file_row is not None and (
-                        primary_file_row.size != primary_info["size"]
-                        or primary_file_row.mtime != primary_info["mtime"]
-                    ):
-                        # File has been modified on disk – invalidate analysis data.
-                        logger.debug(
-                            "Asset id=%d primary_path=%r modified (size/mtime changed).",
-                            existing_asset.id,
-                            primary_path,
-                        )
-                        _delete_analysis_data(session, existing_asset)
-
-                        # Update primary file metadata
-                        primary_file_row.size = primary_info["size"]
-                        primary_file_row.mtime = primary_info["mtime"]
-                        primary_file_row.hash_state = "pending"
-                        primary_file_row.sha256 = None  # hash is now stale
-
-                        # Update asset totals & status
-                        existing_asset.size_total = size_total
+                if existing_asset is not None:
+                    # If asset was previously marked deleted or missing, but is present on disk, revive it
+                    if existing_asset.status in ("deleted", "missing"):
                         existing_asset.status = "unanalysed"
-
-                        summary.modified += 1
-                    else:
+                        _delete_analysis_data(session, existing_asset)
+                        summary.added += 1
+                    elif mode == "new_only":
+                        # Skip entirely in new_only mode.
                         summary.unchanged += 1
-            else:
-                # --------------------------------------------------------
-                # Brand-new asset – insert into DB
-                # --------------------------------------------------------
-                paired_paths = [pf["path"] for pf in paired_infos]
+                    else:
+                        # full mode: check whether the primary file has changed.
+                        primary_file_row: Optional[File] = existing_files.get(primary_path)
+                        if primary_file_row is None:
+                            primary_file_row = session.query(File).filter(File.path == primary_path).first()
+                            if primary_file_row is not None:
+                                existing_files[primary_path] = primary_file_row
 
-                new_asset = Asset(
-                    root_id=root.id,
-                    media_type=media_type,
-                    primary_path=primary_path,
-                    size_total=size_total,
-                    paired_paths=paired_paths,
-                    status="unanalysed",
-                )
-                session.add(new_asset)
-                session.flush()  # populate new_asset.id
+                        if primary_file_row is not None and (
+                            primary_file_row.size != primary_info["size"]
+                            or primary_file_row.mtime != primary_info["mtime"]
+                        ):
+                            # File has been modified on disk – invalidate analysis data.
+                            logger.debug(
+                                "Asset id=%d primary_path=%r modified (size/mtime changed).",
+                                existing_asset.id,
+                                primary_path,
+                            )
+                            _delete_analysis_data(session, existing_asset)
 
-                # Insert File rows for primary and any paired files
-                _upsert_file(
-                    session=session,
-                    asset=new_asset,
-                    path=primary_path,
-                    size=primary_info["size"],
-                    mtime=primary_info["mtime"],
-                    fmt=primary_info["ext"].lstrip(".").lower(),
-                    role="primary",
-                )
-                for pf_info in paired_infos:
+                            # Update primary file metadata
+                            primary_file_row.size = primary_info["size"]
+                            primary_file_row.mtime = primary_info["mtime"]
+                            primary_file_row.hash_state = "pending"
+                            primary_file_row.sha256 = None  # hash is now stale
+
+                            # Update asset totals & status
+                            existing_asset.size_total = size_total
+                            existing_asset.status = "unanalysed"
+
+                            summary.modified += 1
+                        else:
+                            summary.unchanged += 1
+                else:
+                    # --------------------------------------------------------
+                    # Brand-new asset – insert into DB
+                    # --------------------------------------------------------
+                    paired_paths = [pf["path"] for pf in paired_infos]
+
+                    new_asset = Asset(
+                        root_id=root.id,
+                        media_type=media_type,
+                        primary_path=primary_path,
+                        size_total=size_total,
+                        paired_paths=paired_paths,
+                        status="unanalysed",
+                    )
+                    session.add(new_asset)
+                    session.flush()  # populate new_asset.id
+                    existing_assets[primary_path] = new_asset
+
+                    # Insert File rows for primary and any paired files
                     _upsert_file(
                         session=session,
                         asset=new_asset,
-                        path=pf_info["path"],
-                        size=pf_info["size"],
-                        mtime=pf_info["mtime"],
-                        fmt=pf_info["ext"].lstrip(".").lower(),
-                        role="pair",
+                        path=primary_path,
+                        size=primary_info["size"],
+                        mtime=primary_info["mtime"],
+                        fmt=primary_info["ext"].lstrip(".").lower(),
+                        role="primary",
                     )
+                    for pf_info in paired_infos:
+                        _upsert_file(
+                            session=session,
+                            asset=new_asset,
+                            path=pf_info["path"],
+                            size=pf_info["size"],
+                            mtime=pf_info["mtime"],
+                            fmt=pf_info["ext"].lstrip(".").lower(),
+                            role="pair",
+                        )
 
-                summary.added += 1
+                    summary.added += 1
 
             # ----------------------------------------------------------------
             # Progress reporting
@@ -302,39 +321,39 @@ def run_scan_job(
                     new_assets=summary.added,
                 )
 
-        # ------------------------------------------------------------------
-        # 7. Missing-asset detection (full mode only)
-        # ------------------------------------------------------------------
-        if mode == "full":
-            # Find DB assets for this root whose primary_path is no longer on disk
-            # and that haven't already been marked deleted or missing.
-            for asset_path, db_asset in existing_assets.items():
-                if asset_path not in scanned_primary_paths and db_asset.status not in (
-                    "deleted",
-                    "missing",
-                ):
-                    logger.debug(
-                        "Asset id=%d primary_path=%r no longer on disk – marking missing.",
-                        db_asset.id,
-                        asset_path,
-                    )
-                    db_asset.status = "missing"
-                    summary.missing += 1
+            # ------------------------------------------------------------------
+            # 7. Missing-asset detection (full mode only)
+            # ------------------------------------------------------------------
+            if mode == "full":
+                # Find DB assets for this root whose primary_path is no longer on disk
+                # and that haven't already been marked deleted or missing.
+                for asset_path, db_asset in existing_assets.items():
+                    if asset_path not in scanned_primary_paths and db_asset.status not in (
+                        "deleted",
+                        "missing",
+                    ):
+                        logger.debug(
+                            "Asset id=%d primary_path=%r no longer on disk – marking missing.",
+                            db_asset.id,
+                            asset_path,
+                        )
+                        db_asset.status = "missing"
+                        summary.missing += 1
 
-        # ------------------------------------------------------------------
-        # 8. Update root metadata
-        # ------------------------------------------------------------------
-        root.last_scan_at = datetime.utcnow()
-        session.flush()
+            # ------------------------------------------------------------------
+            # 8. Update root metadata
+            # ------------------------------------------------------------------
+            root.last_scan_at = datetime.utcnow()
+            session.flush()
 
-        logger.info(
-            "Root id=%d scan complete: added=%d modified=%d missing=%d unchanged=%d",
-            root.id,
-            summary.added,
-            summary.modified,
-            summary.missing,
-            summary.unchanged,
-        )
+            logger.info(
+                "Root id=%d scan complete: added=%d modified=%d missing=%d unchanged=%d",
+                root.id,
+                summary.added,
+                summary.modified,
+                summary.missing,
+                summary.unchanged,
+            )
 
     # ------------------------------------------------------------------
     # 9. Final progress notification

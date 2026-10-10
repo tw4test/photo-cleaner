@@ -61,27 +61,44 @@ class RulesEngine:
         return config
 
     def evaluate_all_rules(self, session: Session):
-        """執行所有規則並生成候選資料"""
+        """執行所有規則並生成候選資料（保留使用者已排入 queued 或 kept 的處置決定）"""
         config = self._get_active_config(session)
 
-        # 清除舊的候選記錄以利重新評估
+        # 1. 記錄使用者先前手動處置的資產狀態（queued 與 kept 絕不清除丟失）
+        preserved_states = {
+            c.asset_id: c.state
+            for c in session.query(Candidate.asset_id, Candidate.state)
+            .filter(Candidate.state.in_([CandidateState.QUEUED.value, CandidateState.KEPT.value]))
+            .all()
+        }
+
+        # 2. 清除舊的候選記錄以利重新評估
         session.query(Candidate).delete()
         session.query(Group).delete()
         session.flush()
 
-        # 1. 執行完全重複規則 (Exact Duplicates)
+        # 3. 執行完全重複規則 (Exact Duplicates)
         if config.get("rule_exact_dup_enabled", True):
             self._evaluate_exact_duplicates(session, config)
 
-        # 2. 執行近似重複規則 (Near Duplicates via pHash)
+        # 4. 執行近似重複規則 (Near Duplicates via pHash)
         if config.get("rule_near_dup_enabled", True):
             self._evaluate_near_duplicates(session, config)
 
-        # 3. 執行單張質量缺陷規則 (Blur & Exposure)
+        # 5. 執行單張質量缺陷規則 (Blur & Exposure)
         self._evaluate_quality_rules(session, config)
 
-        # 4. 執行 AI 內容語義辨識 (CLIP Zero-Shot: 截圖/文件/梗圖/誤拍)
+        # 6. 執行 AI 內容語義辨識 (CLIP Zero-Shot: 截圖/文件/梗圖/誤拍)
         self._evaluate_ai_semantic_rules(session, config)
+
+        session.flush()
+
+        # 7. 恢復使用者原有的處置狀態 (queued / kept)
+        if preserved_states:
+            for aid, state in preserved_states.items():
+                session.query(Candidate).filter(Candidate.asset_id == aid).update(
+                    {"state": state}, synchronize_session=False
+                )
 
         session.commit()
 
