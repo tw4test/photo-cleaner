@@ -255,10 +255,34 @@ def _clip_worker(
 
             # 執行 CLIP 特徵提取（單次解碼 + 單次 forward 取得 embedding 與 zero-shot）
             try:
+                # 取得本地縮圖快取路徑（若 basic_stage 已生成，直接從本地 NVMe 讀取 320x320，跳過 NAS 網路傳輸）
+                from app.services.thumbnail import thumbnail_service
+                primary_file = None
+                if asset.files:
+                    for f in asset.files:
+                        if f.role == "primary":
+                            primary_file = f
+                            break
+                mtime_v = primary_file.mtime if primary_file else None
+                size_v = primary_file.size if primary_file else None
+                companion_v = (
+                    asset.paired_paths[0]
+                    if (asset.paired_paths and len(asset.paired_paths) > 0)
+                    else None
+                )
+                local_thumb_p = thumbnail_service.get_thumbnail_path(
+                    file_path=primary_path,
+                    mtime=mtime_v,
+                    size=size_v,
+                    companion_path=companion_v,
+                )
+                thumb_str = str(local_thumb_p) if local_thumb_p.exists() else None
+
                 embedding, zs_scores = clip_extractor.extract_all(
                     primary_path,
                     _ZS_LABELS,
                     is_raw=(asset.media_type == "raw"),
+                    thumb_path=thumb_str,
                     model_name=current_model,
                     pretrained=current_pretrained,
                     device=device_used,

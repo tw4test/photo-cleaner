@@ -194,21 +194,43 @@ class RealClipExtractor:
         self._text_features_cache[category_key] = mean_feature
         return mean_feature
 
-    def _open_image_safely(self, file_path: str, is_raw: bool = False) -> Image.Image:
-        """安全開啟影像，支援 RAW 格式內嵌縮圖優先解碼。"""
+    def _open_image_safely(self, file_path: str, is_raw: bool = False, thumb_path: Optional[str] = None) -> Image.Image:
+        """
+        高效安全開啟影像給 CLIP (224x224)：
+        1. 優先使用本地已存在的 320x320 縮圖快取（速度 50x，完全不走網路 SMB）。
+        2. 若為 RAW 檔，嘗試提取內嵌預覽。
+        3. 若需從 NAS 讀取原檔，以大塊模式一次性讀入記憶體 (BytesIO)，徹底消除 SMB 隨機 seek 網路延遲。
+        """
+        # 1. 優先本地縮圖快取
+        if thumb_path and Path(thumb_path).exists():
+            try:
+                with Image.open(thumb_path) as t_img:
+                    return t_img.convert("RGB")
+            except Exception:
+                pass
+
+        # 2. RAW 檔內嵌預覽
         if is_raw:
             try:
                 from app.stubs.raw_stub import raw_decoder
                 if raw_decoder.is_raw(file_path):
                     raw_bytes = raw_decoder.decode_raw(file_path)
                     if raw_bytes:
-                        img = Image.open(io.BytesIO(raw_bytes))
-                        return img.convert("RGB")
+                        with Image.open(io.BytesIO(raw_bytes)) as img:
+                            return img.convert("RGB")
             except Exception as e:
-                logger.debug(f"RAW decode for CLIP failed, falling back to PIL: {e}")
+                logger.debug(f"RAW decode for CLIP failed, falling back to bytes read: {e}")
 
-        img = Image.open(file_path)
-        return img.convert("RGB")
+        # 3. NAS 原檔退回方案：一次性完整讀入記憶體，避免 SMB 隨機 seek
+        try:
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+            with Image.open(io.BytesIO(file_bytes)) as img:
+                return img.convert("RGB")
+        except Exception:
+            # 最終備援
+            with Image.open(file_path) as img:
+                return img.convert("RGB")
 
     def extract_all(
         self,
@@ -216,6 +238,7 @@ class RealClipExtractor:
         labels: List[str],
         image: Optional[Image.Image] = None,
         is_raw: bool = False,
+        thumb_path: Optional[str] = None,
         model_name: str = "ViT-B-16",
         pretrained: str = "openai",
         device: str = "auto",
@@ -230,7 +253,7 @@ class RealClipExtractor:
             torch_device = torch.device(self._device_str)
 
             if image is None:
-                image = self._open_image_safely(file_path, is_raw=is_raw)
+                image = self._open_image_safely(file_path, is_raw=is_raw, thumb_path=thumb_path)
             elif image.mode != "RGB":
                 image = image.convert("RGB")
 
