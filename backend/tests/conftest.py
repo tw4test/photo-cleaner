@@ -20,5 +20,6 @@ def clean_db():
         session.query(File).delete()
         session.query(Asset).delete()
         session.query(Root).delete()
+        session.query(Setting).delete()
         session.commit()
     yield

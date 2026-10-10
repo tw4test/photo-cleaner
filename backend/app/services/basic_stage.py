@@ -15,10 +15,20 @@ decode, or is missing its cached thumbnail on disk, this module:
 
 Video assets are deliberately skipped — they have their own stage.
 Deleted / missing assets are also skipped.
+
+Multi-threading
+---------------
+Candidate filtering (_needs_processing) runs in the main thread.
+Actual thumbnail + feature extraction is dispatched across `runners`
+threads via ThreadPoolExecutor.  Each worker opens its own
+SyncSessionLocal session.  A threading.Lock-protected counter drives
+progress reporting to progress_tracker.
 """
 
-import hashlib
 import logging
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 
@@ -98,6 +108,152 @@ def _needs_processing(asset: Asset, retry_failed: bool) -> bool:
     return False
 
 
+def _split_chunks(items: list, n: int) -> list[list]:
+    """將 items 均分為最多 n 個非空 chunk。"""
+    if not items:
+        return []
+    n = min(n, len(items))
+    size = math.ceil(len(items) / n)
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+# ─────────────────────────────────────────────
+# Worker
+# ─────────────────────────────────────────────
+
+def _basic_worker(
+    asset_ids: list[int],
+    cancel_event: threading.Event,
+    progress_lock: threading.Lock,
+    progress_counter: list,
+    total_assets: int,
+    progress_tracker,
+) -> dict:
+    """
+    Worker 函式：在獨立 session 中對指定資產列表執行縮圖生成與基本特徵提取。
+
+    Returns
+    -------
+    dict with keys: done, failed
+    """
+    from app.core.database import SyncSessionLocal
+
+    done = 0
+    failed = 0
+
+    with SyncSessionLocal() as session:
+        for asset_id in asset_ids:
+            if cancel_event.is_set():
+                break
+
+            asset: Optional[Asset] = session.get(Asset, asset_id)
+            if asset is None:
+                with progress_lock:
+                    progress_counter[0] += 1
+                continue
+
+            primary_path = asset.primary_path
+            is_raw = asset.media_type == "raw"
+
+            try:
+                # ── 1. Generate / refresh thumbnail ──────────────────────────
+                primary_file = None
+                if asset.files:
+                    for f in asset.files:
+                        if f.role == "primary":
+                            primary_file = f
+                            break
+                mtime_v = primary_file.mtime if primary_file else None
+                size_v = primary_file.size if primary_file else None
+                companion_v = (
+                    asset.paired_paths[0]
+                    if (asset.paired_paths and len(asset.paired_paths) > 0)
+                    else None
+                )
+
+                thumbnail_service.generate_thumbnail(
+                    file_path=primary_path,
+                    companion_path=companion_v,
+                    mtime=mtime_v,
+                    size=size_v,
+                )
+
+                # ── 2. Extract basic features ─────────────────────────────────
+                feats = feature_pipeline.extract_basic(primary_path, is_raw=is_raw)
+
+                # ── 3. Upsert Feature record ──────────────────────────────────
+                feat_record: Optional[Feature] = asset.features
+                if feat_record is None:
+                    feat_record = Feature(asset_id=asset.id)
+                    session.add(feat_record)
+
+                feat_record.phash         = feats["phash"]
+                feat_record.blur_score    = feats["blur_score"]
+                feat_record.brightness    = feats["brightness"]
+                feat_record.width         = feats["width"]
+                feat_record.height        = feats["height"]
+                feat_record.taken_at      = feats["taken_at"]
+                feat_record.exif          = feats["exif"]
+                feat_record.decode_status = feats["decode_status"]
+                feat_record.analyzed_at   = datetime.utcnow()
+
+                # ── 4. Promote asset status ───────────────────────────────────
+                if asset.status == "unanalysed":
+                    asset.status = "analysed"
+
+                # ── 5. Clear any prior failure record ─────────────────────────
+                session.query(AnalysisFailure).filter(
+                    AnalysisFailure.asset_id == asset.id,
+                    AnalysisFailure.stage == "basic",
+                ).delete()
+
+                session.flush()
+                session.commit()
+                done += 1
+                logger.debug("basic_stage: completed asset %d (%s)", asset.id, primary_path)
+
+            except Exception as exc:
+                session.rollback()
+                logger.warning(
+                    "basic_stage: error processing asset %d (%s) — %s",
+                    asset_id, primary_path, exc,
+                )
+                try:
+                    asset = session.get(Asset, asset_id)
+                    feat_record = asset.features if asset else None
+                    if feat_record is None and asset:
+                        feat_record = Feature(
+                            asset_id=asset_id,
+                            decode_status="error",
+                            analyzed_at=datetime.utcnow(),
+                        )
+                        session.add(feat_record)
+                    elif feat_record:
+                        feat_record.decode_status = "error"
+                        feat_record.analyzed_at = datetime.utcnow()
+
+                    _upsert_failure(session, asset_id, "basic", str(exc))
+                    session.flush()
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                failed += 1
+
+            finally:
+                with progress_lock:
+                    progress_counter[0] += 1
+                    current = progress_counter[0]
+                if progress_tracker:
+                    try:
+                        progress_tracker.update_analyze_progress(
+                            current, total_assets, primary_path
+                        )
+                    except InterruptedError:
+                        cancel_event.set()
+
+    return {"done": done, "failed": failed}
+
+
 # ─────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────
@@ -107,37 +263,40 @@ def run_basic_stage(
     retry_failed: bool = False,
     merge_with_clip: bool = False,
     progress_tracker=None,
+    runners: Optional[int] = None,
 ) -> dict:
     """
     Execute the basic analysis stage.
 
     Parameters
     ----------
-    session        : Active SQLAlchemy sync session.  The caller is
-                     responsible for commit / rollback.
+    session        : Active SQLAlchemy sync session.  Used only for the
+                     initial candidate query; workers open their own sessions.
     retry_failed   : If True, assets whose Feature.decode_status == 'error'
                      are re-processed.
-    merge_with_clip: If True (set by analyze_job when running basic+clip together),
-                     the opened PIL image is stored in the Feature record for
-                     the clip_stage to reuse (A-3 merge decode).
-                     Currently the stub doesn't need actual image object sharing,
-                     so this flag is reserved for future real implementation.
+    merge_with_clip: Reserved for A-3 merge-decode optimization (currently
+                     no-op at the worker level).
     progress_tracker : Optional object with `is_cancel_requested() -> bool`.
+    runners        : Number of parallel worker threads.  Defaults to
+                     settings.BASIC_RUNNERS.
 
     Returns
     -------
     dict with keys: processed, done, failed
     """
+    if runners is None:
+        runners = settings.BASIC_RUNNERS
+    runners = max(1, runners)
+
     stats = {"processed": 0, "done": 0, "failed": 0}
 
-    # Fetch candidate assets: photo and raw only, not deleted/missing
+    # ── Fetch candidates (main thread) ────────────────────────────────────────
     candidates = (
         session.query(Asset)
         .filter(
             Asset.media_type.in_(["photo", "raw"]),
             Asset.status.notin_(["deleted", "missing"]),
         )
-        # Eagerly load the features relationship to avoid N+1 queries
         .all()
     )
 
@@ -147,101 +306,77 @@ def run_basic_stage(
 
     logger.info("basic_stage: evaluating %d candidate asset(s)", total_candidates)
 
-    for idx, asset in enumerate(candidates):
-        # Respect cancellation
-        if progress_tracker is not None and progress_tracker.is_cancel_requested():
-            logger.info("basic_stage: cancel requested, stopping early")
-            break
+    # ── Filter assets that need processing ────────────────────────────────────
+    to_process_ids = [
+        asset.id
+        for asset in candidates
+        if _needs_processing(asset, retry_failed)
+    ]
 
-        if not _needs_processing(asset, retry_failed):
-            if progress_tracker:
-                progress_tracker.update_analyze_progress(idx + 1, total_candidates, asset.primary_path)
-            continue
+    total_to_process = len(to_process_ids)
+    not_needed = total_candidates - total_to_process
 
-        stats["processed"] += 1
-        primary_path = asset.primary_path
-        is_raw = asset.media_type == "raw"
+    # 未需要處理的資產也需推進進度計數（保持進度條正確）
+    # 但已全部放在 total_candidates 的 total 中，worker 進度會從 0 跑到 total_to_process
+    # 更新 total 以反映實際工作量
+    if progress_tracker:
+        progress_tracker.set_current_stage("basic", total=total_to_process)
 
-        try:
-            # ── 1. Generate / refresh thumbnail ──────────────────────────────
-            primary_file = None
-            if asset.files:
-                for f in asset.files:
-                    if f.role == "primary":
-                        primary_file = f
-                        break
-            mtime_v = primary_file.mtime if primary_file else None
-            size_v = primary_file.size if primary_file else None
-            companion_v = asset.paired_paths[0] if (asset.paired_paths and len(asset.paired_paths) > 0) else None
+    logger.info(
+        "basic_stage: %d to process, %d already done, using %d runner(s)",
+        total_to_process, not_needed, runners,
+    )
 
-            thumbnail_service.generate_thumbnail(
-                file_path=primary_path,
-                companion_path=companion_v,
-                mtime=mtime_v,
-                size=size_v
+    if total_to_process == 0:
+        logger.info("basic_stage complete — nothing to process")
+        return stats
+
+    # ── Commit before dispatch ─────────────────────────────────────────────────
+    # Worker 使用獨立 session，只能看到已 commit 的資料。
+    # 此處 commit 確保主 session 中 flush 但未 commit 的資料對 worker 可見。
+    session.commit()
+
+    # ── Cancel check before dispatch ──────────────────────────────────────────
+    cancel_event = threading.Event()
+    if progress_tracker and progress_tracker.is_cancel_requested():
+        cancel_event.set()
+
+    progress_lock = threading.Lock()
+    progress_counter = [0]
+
+    chunks = _split_chunks(to_process_ids, runners)
+    actual_runners = len(chunks)
+    logger.info(
+        "basic_stage: dispatching %d asset(s) across %d thread(s)",
+        total_to_process, actual_runners,
+    )
+
+    # ── Parallel execution ────────────────────────────────────────────────────
+    with ThreadPoolExecutor(max_workers=actual_runners) as executor:
+        futures = [
+            executor.submit(
+                _basic_worker,
+                chunk,
+                cancel_event,
+                progress_lock,
+                progress_counter,
+                total_to_process,
+                progress_tracker,
             )
+            for chunk in chunks
+        ]
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                stats["done"] += result["done"]
+                stats["failed"] += result["failed"]
+                stats["processed"] += result["done"] + result["failed"]
+            except Exception as exc:
+                logger.error("basic_stage: worker raised unexpected error: %s", exc, exc_info=True)
 
-            # ── 2. Extract basic features ─────────────────────────────────────
-            feats = feature_pipeline.extract_basic(primary_path, is_raw=is_raw)
-            # feats keys: phash, blur_score, brightness, width, height,
-            #             taken_at, exif, decode_status
-
-            # ── 3. Upsert Feature record ───────────────────────────────────────
-            feat_record: Optional[Feature] = asset.features
-            if feat_record is None:
-                feat_record = Feature(asset_id=asset.id)
-                session.add(feat_record)
-
-            feat_record.phash        = feats["phash"]
-            feat_record.blur_score   = feats["blur_score"]
-            feat_record.brightness   = feats["brightness"]
-            feat_record.width        = feats["width"]
-            feat_record.height       = feats["height"]
-            feat_record.taken_at     = feats["taken_at"]
-            feat_record.exif         = feats["exif"]
-            feat_record.decode_status = feats["decode_status"]
-            feat_record.analyzed_at  = datetime.utcnow()
-
-            # ── 4. Promote asset status ────────────────────────────────────────
-            if asset.status == "unanalysed":
-                asset.status = "analysed"
-
-            # ── 5. Clear any prior failure record for this stage ──────────────
-            session.query(AnalysisFailure).filter(
-                AnalysisFailure.asset_id == asset.id,
-                AnalysisFailure.stage == "basic",
-            ).delete()
-
-            session.flush()
-            stats["done"] += 1
-            logger.debug("basic_stage: completed asset %d (%s)", asset.id, primary_path)
-
-        except Exception as exc:
-            logger.warning(
-                "basic_stage: error processing asset %d (%s) — %s",
-                asset.id, primary_path, exc
-            )
-
-            # Ensure a Feature row exists so we can record the error status
-            feat_record = asset.features
-            if feat_record is None:
-                feat_record = Feature(
-                    asset_id=asset.id,
-                    decode_status="error",
-                    analyzed_at=datetime.utcnow(),
-                )
-                session.add(feat_record)
-            else:
-                feat_record.decode_status = "error"
-                feat_record.analyzed_at   = datetime.utcnow()
-
-            _upsert_failure(session, asset.id, "basic", str(exc))
-            session.flush()
-            stats["failed"] += 1
-
-        finally:
-            if progress_tracker:
-                progress_tracker.update_analyze_progress(idx + 1, total_candidates, asset.primary_path)
+    # Worker 在獨立 session 中 commit，主 session 的 identity map 已過期。
+    # expire_all 確保後續查詢從 DB 重新讀取最新資料。
+    session.expire_all()
 
     logger.info(
         "basic_stage complete — processed=%d done=%d failed=%d",
@@ -313,4 +448,3 @@ def run_rebuild_thumbs_only(
                 progress_tracker.update_analyze_progress(idx + 1, total, asset.primary_path)
 
     return stats
-

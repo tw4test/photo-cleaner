@@ -10,14 +10,27 @@ CLIP 分析階段服務。
 - 首次分析（無 `clip_features` 記錄）
 - 模型設定變更後的過期記錄重新分析
 - 重試先前失敗的資產（`retry_failed=True`）
+
+Multi-threading
+---------------
+候選資產篩選在主線程完成。實際 CLIP 推理分發至 `runners` 個 worker
+執行緒（ThreadPoolExecutor），每個 worker 使用獨立的 SyncSessionLocal
+session。進度以 threading.Lock 保護的計數器推進。
+
+⚠️ GPU 注意事項：當 device='cuda' 時，建議 runners=1，
+   多 thread 搶占同一 CUDA context 可能導致效能下降或錯誤。
 """
 
 import json
 import logging
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from app.core.config import settings
 from app.models.schema import Asset, ClipFeature, AnalysisFailure, File
 from app.stubs.clip_stub import clip_extractor
 
@@ -141,12 +154,182 @@ def _clear_analysis_failure(session, asset_id: int, stage: str) -> None:
     session.query(AnalysisFailure).filter_by(asset_id=asset_id, stage=stage).delete()
 
 
+def _split_chunks(items: list, n: int) -> list[list]:
+    """將 items 均分為最多 n 個非空 chunk。"""
+    if not items:
+        return []
+    n = min(n, len(items))
+    size = math.ceil(len(items) / n)
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+# ─────────────────────────────────────────────
+# Worker
+# ─────────────────────────────────────────────
+
+def _clip_worker(
+    asset_ids: list[int],
+    current_model: str,
+    current_pretrained: str,
+    device_used: str,
+    failed_ids: set[int],
+    cancel_event: threading.Event,
+    progress_lock: threading.Lock,
+    progress_counter: list,
+    total_assets: int,
+    progress_tracker,
+) -> dict:
+    """
+    Worker 函式：在獨立 session 中對指定資產列表執行 CLIP 特徵提取。
+
+    Returns
+    -------
+    dict with keys: processed, done, stale_found, failed
+    """
+    from app.core.database import SyncSessionLocal
+
+    processed = 0
+    done = 0
+    stale_found = 0
+    failed = 0
+
+    with SyncSessionLocal() as session:
+        for asset_id in asset_ids:
+            if cancel_event.is_set():
+                break
+
+            asset: Optional[Asset] = session.get(Asset, asset_id)
+            if asset is None:
+                with progress_lock:
+                    progress_counter[0] += 1
+                continue
+
+            primary_path = asset.primary_path
+
+            # 確認實體檔案存在
+            if not Path(primary_path).exists():
+                logger.debug(
+                    "[clip_stage] 跳過 asset_id=%d，檔案不存在：%s",
+                    asset.id, primary_path,
+                )
+                with progress_lock:
+                    progress_counter[0] += 1
+                    current = progress_counter[0]
+                if progress_tracker:
+                    try:
+                        progress_tracker.update_analyze_progress(current, total_assets, primary_path)
+                    except InterruptedError:
+                        cancel_event.set()
+                continue
+
+            # 判斷是否需要處理
+            clip_rec: Optional[ClipFeature] = asset.clip_feature
+            is_missing = clip_rec is None
+            is_stale = (
+                not is_missing
+                and (
+                    clip_rec.model != current_model
+                    or clip_rec.pretrained != current_pretrained
+                )
+            )
+            is_failed_retry = asset.id in failed_ids
+
+            if not is_missing and not is_stale and not is_failed_retry:
+                done += 1
+                with progress_lock:
+                    progress_counter[0] += 1
+                    current = progress_counter[0]
+                if progress_tracker:
+                    try:
+                        progress_tracker.update_analyze_progress(current, total_assets, primary_path)
+                    except InterruptedError:
+                        cancel_event.set()
+                continue
+
+            if is_stale:
+                stale_found += 1
+                logger.debug(
+                    "[clip_stage] asset_id=%d 的 CLIP 記錄已過期（model 或 pretrained 不符），重新分析",
+                    asset.id,
+                )
+
+            # 執行 CLIP 特徵提取
+            try:
+                embedding: bytes = clip_extractor.extract_embedding(
+                    primary_path,
+                    model_name=current_model,
+                    pretrained=current_pretrained,
+                    device=device_used,
+                )
+                zs_scores: dict = clip_extractor.classify_zero_shot(
+                    primary_path,
+                    _ZS_LABELS,
+                    model_name=current_model,
+                    pretrained=current_pretrained,
+                    device=device_used,
+                )
+                dim = len(embedding) // 4  # float32 → 每個元素 4 bytes
+
+                # Upsert ClipFeature
+                if clip_rec is None:
+                    clip_rec = ClipFeature(asset_id=asset.id)
+                    session.add(clip_rec)
+
+                clip_rec.model = current_model
+                clip_rec.pretrained = current_pretrained
+                clip_rec.dim = dim
+                clip_rec.embedding = embedding
+                clip_rec.zs = zs_scores
+                clip_rec.analyzed_at = datetime.utcnow()
+
+                _clear_analysis_failure(session, asset.id, "clip")
+
+                session.flush()
+                session.commit()
+                processed += 1
+                logger.debug(
+                    "[clip_stage] asset_id=%d 分析完成，dim=%d，zs=%s",
+                    asset.id, dim, zs_scores,
+                )
+
+            except Exception as exc:
+                session.rollback()
+                error_msg = str(exc)
+                logger.warning(
+                    "[clip_stage] asset_id=%d 分析失敗：%s", asset.id, error_msg
+                )
+                try:
+                    _upsert_analysis_failure(session, asset.id, "clip", error_msg)
+                    session.flush()
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                failed += 1
+
+            finally:
+                with progress_lock:
+                    progress_counter[0] += 1
+                    current = progress_counter[0]
+                if progress_tracker:
+                    try:
+                        progress_tracker.update_analyze_progress(current, total_assets, primary_path)
+                    except InterruptedError:
+                        cancel_event.set()
+
+    return {"processed": processed, "done": done, "stale_found": stale_found, "failed": failed}
+
+
+# ─────────────────────────────────────────────
+# Public entry point
+# ─────────────────────────────────────────────
+
 def run_clip_stage(
     session,
     device: str = "auto",
     retry_failed: bool = False,
     merge_with_basic: bool = False,
     progress_tracker=None,
+    runners: Optional[int] = None,
 ) -> dict:
     """
     執行 CLIP 分析階段。
@@ -164,11 +347,13 @@ def run_clip_stage(
     - `asset.primary_path` 所指向的實體檔案不存在
 
     Args:
-        session:          SQLAlchemy 同步 Session。
+        session:          SQLAlchemy 同步 Session（用於候選資產查詢）。
         device:           運算裝置，'auto' | 'cuda' | 'cpu'。
         retry_failed:     若為 True，亦重新處理有失敗記錄的資產。
-        merge_with_basic: 若為 True，表示與 basic 階段同次執行，可合併解碼。
+        merge_with_basic: 若為 True，表示與 basic 階段同次執行（保留供未來優化用）。
         progress_tracker: 可選的進度追蹤物件。
+        runners:          並行 worker 線程數。預設使用 settings.CLIP_RUNNERS。
+                          ⚠️ 使用 CUDA 時建議設為 1。
 
     Returns:
         dict with keys:
@@ -181,8 +366,20 @@ def run_clip_stage(
     Raises:
         RuntimeError: 當 device='cuda' 但 CUDA 不可用時。
     """
+    if runners is None:
+        runners = settings.CLIP_RUNNERS
+    runners = max(1, runners)
+
     # 1. 解析裝置
     device_used = _resolve_device(device)
+
+    # GPU 模式下自動縮減為 1 runner，避免 CUDA context 衝突
+    if device_used == "cuda" and runners > 1:
+        logger.info(
+            "[clip_stage] 偵測到 CUDA 裝置，自動將 runners 從 %d 調整為 1（GPU 推理單線程最佳）",
+            runners,
+        )
+        runners = 1
 
     # 2. 取得目前 CLIP 模型設定
     current_model, current_pretrained = _get_clip_settings(session)
@@ -207,120 +404,79 @@ def run_clip_stage(
     )
 
     total_assets = len(photo_raw_assets)
+    asset_ids = [a.id for a in photo_raw_assets]
+
     if progress_tracker:
         progress_tracker.set_current_stage("clip", total=total_assets)
 
-    # 統計計數器
-    processed = 0
-    done = 0
-    stale_found = 0
-    failed = 0
+    logger.info(
+        "[clip_stage] %d 個候選資產，使用 %d runner(s)，裝置：%s",
+        total_assets, runners, device_used,
+    )
 
-    for idx, asset in enumerate(photo_raw_assets):
-        if progress_tracker and progress_tracker.is_cancel_requested():
-            logger.info("[clip_stage] 收到使用者取消請求，提前停止")
-            break
+    if total_assets == 0:
+        result = {"processed": 0, "done": 0, "stale_found": 0, "failed": 0, "device_used": device_used}
+        logger.info("[clip_stage] 完成：%s", result)
+        return result
 
-        # 5. 確認實體檔案存在
-        if not Path(asset.primary_path).exists():
-            logger.debug(
-                "[clip_stage] 跳過 asset_id=%d，檔案不存在：%s",
-                asset.id,
-                asset.primary_path,
-            )
-            if progress_tracker:
-                progress_tracker.update_analyze_progress(idx + 1, total_assets, asset.primary_path)
-            continue
-
-        # 6. 判斷是否需要處理
-        clip_rec: Optional[ClipFeature] = asset.clip_feature
-        is_missing = clip_rec is None
-        is_stale = (
-            not is_missing
-            and (
-                clip_rec.model != current_model
-                or clip_rec.pretrained != current_pretrained
-            )
-        )
-        is_failed_retry = asset.id in failed_ids
-
-        if not is_missing and not is_stale and not is_failed_retry:
-            # 記錄已存在且為最新，跳過
-            done += 1
-            if progress_tracker:
-                progress_tracker.update_analyze_progress(idx + 1, total_assets, asset.primary_path)
-            continue
-
-        if is_stale:
-            stale_found += 1
-            logger.debug(
-                "[clip_stage] asset_id=%d 的 CLIP 記錄已過期（model 或 pretrained 不符），重新分析",
-                asset.id,
-            )
-
-        # 7. 執行 CLIP 特徵提取
-        try:
-            embedding: bytes = clip_extractor.extract_embedding(
-                asset.primary_path,
-                model_name=current_model,
-                pretrained=current_pretrained,
-                device=device_used,
-            )
-            zs_scores: dict = clip_extractor.classify_zero_shot(
-                asset.primary_path,
-                _ZS_LABELS,
-                model_name=current_model,
-                pretrained=current_pretrained,
-                device=device_used,
-            )
-            dim = len(embedding) // 4  # float32 → 每個元素 4 bytes
-
-            # 8. Upsert ClipFeature
-            if clip_rec is None:
-                clip_rec = ClipFeature(asset_id=asset.id)
-                session.add(clip_rec)
-
-            clip_rec.model = current_model
-            clip_rec.pretrained = current_pretrained
-            clip_rec.dim = dim
-            clip_rec.embedding = embedding
-            clip_rec.zs = zs_scores
-            clip_rec.analyzed_at = datetime.utcnow()
-
-            # 成功後清除失敗記錄
-            _clear_analysis_failure(session, asset.id, "clip")
-
-            session.flush()
-            processed += 1
-            logger.debug(
-                "[clip_stage] asset_id=%d 分析完成，dim=%d，zs=%s",
-                asset.id,
-                dim,
-                zs_scores,
-            )
-
-        except Exception as exc:
-            # 9. 記錄失敗，繼續處理下一個資產
-            error_msg = str(exc)
-            logger.warning(
-                "[clip_stage] asset_id=%d 分析失敗：%s", asset.id, error_msg
-            )
-            _upsert_analysis_failure(session, asset.id, "clip", error_msg)
-            session.flush()
-            failed += 1
-
-        finally:
-            if progress_tracker:
-                progress_tracker.update_analyze_progress(idx + 1, total_assets, asset.primary_path)
-
-    # 10. 統一提交
+    # 5. 並行執行前 commit，確保 worker session 可見主 session 的最新資料
     session.commit()
 
+    cancel_event = threading.Event()
+    if progress_tracker and progress_tracker.is_cancel_requested():
+        cancel_event.set()
+
+    progress_lock = threading.Lock()
+    progress_counter = [0]
+
+    chunks = _split_chunks(asset_ids, runners)
+    actual_runners = len(chunks)
+    logger.info(
+        "[clip_stage] dispatching %d asset(s) across %d thread(s)",
+        total_assets, actual_runners,
+    )
+
+    # 統計計數器（aggregate）
+    total_processed = 0
+    total_done = 0
+    total_stale = 0
+    total_failed = 0
+
+    with ThreadPoolExecutor(max_workers=actual_runners) as executor:
+        futures = [
+            executor.submit(
+                _clip_worker,
+                chunk,
+                current_model,
+                current_pretrained,
+                device_used,
+                failed_ids,
+                cancel_event,
+                progress_lock,
+                progress_counter,
+                total_assets,
+                progress_tracker,
+            )
+            for chunk in chunks
+        ]
+        for future in as_completed(futures):
+            try:
+                r = future.result()
+                total_processed += r["processed"]
+                total_done += r["done"]
+                total_stale += r["stale_found"]
+                total_failed += r["failed"]
+            except Exception as exc:
+                logger.error("[clip_stage] worker raised unexpected error: %s", exc, exc_info=True)
+
+    # Worker 在獨立 session 中 commit，主 session 的 identity map 已過期。
+    session.expire_all()
+
     result = {
-        "processed": processed,
-        "done": done,
-        "stale_found": stale_found,
-        "failed": failed,
+        "processed": total_processed,
+        "done": total_done,
+        "stale_found": total_stale,
+        "failed": total_failed,
         "device_used": device_used,
     }
     logger.info("[clip_stage] 完成：%s", result)

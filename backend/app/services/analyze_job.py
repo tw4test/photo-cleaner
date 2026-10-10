@@ -59,6 +59,10 @@ def run_analyze_job(
     device: str = "auto",
     retry_failed: bool = False,
     progress_tracker=None,
+    hash_runners: Optional[int] = None,
+    basic_runners: Optional[int] = None,
+    clip_runners: Optional[int] = None,
+    video_runners: Optional[int] = None,
 ) -> dict:
     """
     依序執行指定的分析階段。
@@ -69,6 +73,10 @@ def run_analyze_job(
         device: 運算裝置 'auto' | 'cuda' | 'cpu'
         retry_failed: 是否重試失敗的項目
         progress_tracker: ProgressTracker 實例（可 None）
+        hash_runners:  hash  階段並行 worker 數（None = 使用 config 預設）
+        basic_runners: basic 階段並行 worker 數（None = 使用 config 預設）
+        clip_runners:  clip  階段並行 worker 數（None = 使用 config 預設）
+        video_runners: video 階段並行 worker 數（None = 使用 config 預設）
 
     Returns:
         各階段結果的字典，例如：
@@ -119,7 +127,8 @@ def run_analyze_job(
                 from app.services.hash_stage import run_hash_stage
                 result = run_hash_stage(
                     session, retry_failed=retry_failed,
-                    progress_tracker=progress_tracker
+                    progress_tracker=progress_tracker,
+                    runners=hash_runners,
                 )
 
             elif stage == AnalysisStage.BASIC:
@@ -127,7 +136,8 @@ def run_analyze_job(
                 result = run_basic_stage(
                     session, retry_failed=retry_failed,
                     merge_with_clip=merge_decode,
-                    progress_tracker=progress_tracker
+                    progress_tracker=progress_tracker,
+                    runners=basic_runners,
                 )
 
             elif stage == AnalysisStage.CLIP:
@@ -136,7 +146,8 @@ def run_analyze_job(
                     session, device=resolved_device,
                     retry_failed=retry_failed,
                     merge_with_basic=merge_decode,
-                    progress_tracker=progress_tracker
+                    progress_tracker=progress_tracker,
+                    runners=clip_runners,
                 )
                 result["device_used"] = resolved_device
 
@@ -144,8 +155,10 @@ def run_analyze_job(
                 from app.services.video_stage import run_video_stage
                 result = run_video_stage(
                     session, retry_failed=retry_failed,
-                    progress_tracker=progress_tracker
+                    progress_tracker=progress_tracker,
+                    runners=video_runners,
                 )
+
 
             results[stage_name] = result
             logger.info(f"階段 {stage_name} 完成：{result}")
