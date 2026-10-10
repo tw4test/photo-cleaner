@@ -111,16 +111,49 @@ def run_analyze_job(
         AnalysisStage.CLIP in running_stages
     )
 
+    # 從 Settings 讀取預設 runner 設定（若外部呼叫未覆寫）
+    from app.core.config import settings as app_settings
+    from app.models.schema import Setting
+    import json
+
+    def _get_setting_runner(key: str, fallback: int) -> int:
+        try:
+            s = session.query(Setting).get(key)
+            if s:
+                val = json.loads(s.value)
+                if isinstance(val, int) and val > 0:
+                    return val
+        except Exception:
+            pass
+        return fallback
+
+    if hash_runners is None:
+        hash_runners = _get_setting_runner("hash_runners", app_settings.HASH_RUNNERS)
+    if basic_runners is None:
+        basic_runners = _get_setting_runner("basic_runners", app_settings.BASIC_RUNNERS)
+    if clip_runners is None:
+        clip_runners = _get_setting_runner("clip_runners", app_settings.CLIP_RUNNERS)
+    if video_runners is None:
+        video_runners = _get_setting_runner("video_runners", app_settings.VIDEO_RUNNERS)
+
+    stage_runners_map = {
+        AnalysisStage.HASH: hash_runners,
+        AnalysisStage.BASIC: basic_runners,
+        AnalysisStage.CLIP: clip_runners,
+        AnalysisStage.VIDEO: video_runners,
+    }
+
     for stage in running_stages:
         if progress_tracker and progress_tracker.is_cancel_requested():
             logger.info(f"使用者已取消，停止於 {stage.value} 階段前")
             break
 
         stage_name = stage.value
-        logger.info(f"開始執行分析階段：{stage_name}")
+        stage_runner_count = stage_runners_map.get(stage, 1)
+        logger.info(f"開始執行分析階段：{stage_name}，runner={stage_runner_count}")
 
         if progress_tracker:
-            progress_tracker.set_current_stage(stage_name)
+            progress_tracker.set_current_stage(stage_name, runners=stage_runner_count)
 
         try:
             if stage == AnalysisStage.HASH:

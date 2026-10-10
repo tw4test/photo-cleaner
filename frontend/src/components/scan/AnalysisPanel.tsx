@@ -10,7 +10,9 @@ import {
   Play, 
   RotateCcw,
   Zap,
-  ShieldCheck
+  ShieldCheck,
+  Plus,
+  Minus
 } from 'lucide-react'
 import { AnalysisStatus, GpuDiagnosticStatus } from '../../services/types'
 import { api } from '../../services/api'
@@ -50,9 +52,34 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
     }
   }, [])
 
+  const [runners, setRunners] = useState<Record<string, number>>({
+    hash: status?.runners?.hash ?? 4,
+    basic: status?.runners?.basic ?? 4,
+    clip: status?.runners?.clip ?? 4,
+    video: status?.runners?.video ?? 4,
+  })
+
   useEffect(() => {
-    loadGpuStatus()
-  }, [loadGpuStatus])
+    if (status?.runners) {
+      setRunners(status.runners)
+    }
+  }, [status?.runners])
+
+  const handleRunnerChange = async (stageKey: string, delta: number) => {
+    const current = runners[stageKey] ?? 4
+    const nextVal = Math.max(1, Math.min(16, current + delta))
+    if (nextVal === current) return
+
+    const newRunners = { ...runners, [stageKey]: nextVal }
+    setRunners(newRunners)
+
+    try {
+      await api.updateSettings({ [`${stageKey}_runners`]: nextVal }, false)
+      await onRefreshStatus()
+    } catch (err) {
+      console.error('Failed to update runner count:', err)
+    }
+  }
 
   const handleRefreshAll = async () => {
     await Promise.all([onRefreshStatus(), loadGpuStatus(true)])
@@ -260,14 +287,41 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
                     {stage.icon}
                     <span>{stage.title}</span>
                   </div>
-                  <button
-                    disabled={isAnalyzing}
-                    onClick={() => onTriggerAnalyze([stage.id], device, false)}
-                    className="flex items-center gap-1 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 rounded-lg text-[11px] font-medium border border-slate-700 transition-colors cursor-pointer"
-                  >
-                    <Play className="w-3 h-3 text-purple-400" />
-                    <span>單獨執行</span>
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1 bg-slate-900 border border-slate-700/80 rounded-lg px-1.5 py-0.5 text-[11px] font-mono">
+                      <span className="text-sky-400 font-bold">⚡ {runners[stage.id] ?? 4}</span>
+                      <span className="text-slate-500 text-[10px]">T</span>
+                      <div className="flex items-center gap-0.5 ml-1 border-l border-slate-700 pl-1">
+                        <button
+                          type="button"
+                          onClick={() => handleRunnerChange(stage.id, -1)}
+                          disabled={isAnalyzing || (runners[stage.id] ?? 4) <= 1}
+                          className="hover:text-sky-300 text-slate-400 disabled:opacity-30 cursor-pointer"
+                          title="減少 1 個線程"
+                        >
+                          <Minus className="w-2.5 h-2.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRunnerChange(stage.id, 1)}
+                          disabled={isAnalyzing || (runners[stage.id] ?? 4) >= 16}
+                          className="hover:text-sky-300 text-slate-400 disabled:opacity-30 cursor-pointer"
+                          title="增加 1 個線程"
+                        >
+                          <Plus className="w-2.5 h-2.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <button
+                      disabled={isAnalyzing}
+                      onClick={() => onTriggerAnalyze([stage.id], device, false)}
+                      className="flex items-center gap-1 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 rounded-lg text-[11px] font-medium border border-slate-700 transition-colors cursor-pointer"
+                    >
+                      <Play className="w-3 h-3 text-purple-400" />
+                      <span>單獨執行</span>
+                    </button>
+                  </div>
                 </div>
                 <p className="text-[11px] text-slate-500 leading-relaxed">{stage.desc}</p>
               </div>

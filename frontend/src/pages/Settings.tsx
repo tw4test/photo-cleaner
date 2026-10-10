@@ -11,7 +11,11 @@ import {
   FileText,
   Smartphone,
   Laugh,
-  EyeOff
+  EyeOff,
+  Cpu,
+  Zap,
+  Plus,
+  Minus
 } from 'lucide-react'
 import { api } from '../services/api'
 
@@ -448,7 +452,108 @@ export const Settings: React.FC = () => {
         </div>
       </div>
 
-      {/* Section 3: 安全與刪除偏好 */}
+      {/* Section 3: 多線程並行處理設定 (Multi-threading Runners) */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6">
+        <div className="border-b border-slate-800 pb-4">
+          <h3 className="text-base font-semibold text-slate-100 flex items-center gap-2">
+            <Cpu className="w-5 h-5 text-sky-400" />
+            <span>並行效能與線程設定（Multi-threading Runners）</span>
+          </h3>
+          <p className="text-xs text-slate-400 mt-0.5">
+            配置相片分析工作台四個獨立階段的背景並行線程數。適當調高可巨幅縮短處理數千至數萬張相片的時間。
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {[
+            {
+              key: 'hash_runners',
+              name: '檔案雜湊 (Hash 階段)',
+              desc: '計算檔案 SHA-256 雜湊值（I/O 密集型）。',
+              rec: '推薦：CPU 核心數一半 (例如 4~8)',
+              icon: <Zap className="w-4 h-4 text-sky-400" />,
+            },
+            {
+              key: 'basic_runners',
+              name: '縮圖與基本特徵 (Basic 階段)',
+              desc: '生成縮圖快取與 Laplacian 清晰度/亮度計算（CPU 密集型）。',
+              rec: '推薦：CPU 核心數一半 (例如 2~6)',
+              icon: <Zap className="w-4 h-4 text-emerald-400" />,
+            },
+            {
+              key: 'clip_runners',
+              name: 'CLIP 語義向量 (CLIP 階段)',
+              desc: 'AI 語義向量提取與零樣本分類（神經網路推理）。',
+              rec: '推薦：CPU 模式 2~4；CUDA (GPU) 模式建議設為 1 (GPU 單流水線最高效)',
+              icon: <Zap className="w-4 h-4 text-purple-400" />,
+            },
+            {
+              key: 'video_runners',
+              name: '影片資訊探查 (Video 階段)',
+              desc: '解析影片容器時長、解析度與編碼（I/O 與解碼型）。',
+              rec: '推薦：2~4',
+              icon: <Zap className="w-4 h-4 text-amber-400" />,
+            },
+          ].map((item) => {
+            const currentVal = Math.max(1, Math.min(16, Number(config[item.key] ?? 4)))
+            return (
+              <div key={item.key} className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    {item.icon}
+                    <span className="font-semibold text-slate-200 text-sm">{item.name}</span>
+                  </div>
+                  <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-950 text-sky-300 border border-sky-800/60">
+                    ⚡ {currentVal} Runners
+                  </span>
+                </div>
+
+                <p className="text-xs text-slate-400 leading-relaxed">{item.desc}</p>
+                <div className="text-[11px] text-slate-500 font-mono">{item.rec}</div>
+
+                <div className="flex items-center justify-between pt-2 border-t border-slate-800/80">
+                  <span className="text-xs text-slate-400 font-medium">線程數 (1 ~ 16)：</span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => handleChange(item.key, Math.max(1, currentVal - 1))}
+                      disabled={currentVal <= 1}
+                      className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 transition-colors cursor-pointer"
+                      title="減少 1 個線程"
+                    >
+                      <Minus className="w-3.5 h-3.5" />
+                    </button>
+                    <input
+                      type="number"
+                      min="1"
+                      max="16"
+                      value={currentVal}
+                      onChange={(e) => {
+                        const parsed = parseInt(e.target.value, 10)
+                        if (!isNaN(parsed)) {
+                          handleChange(item.key, Math.max(1, Math.min(16, parsed)))
+                        }
+                      }}
+                      className="w-14 text-center bg-slate-900 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs py-1 focus:ring-1 focus:ring-sky-500 focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleChange(item.key, Math.min(16, currentVal + 1))}
+                      disabled={currentVal >= 16}
+                      className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300 transition-colors cursor-pointer"
+                      title="增加 1 個線程"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* Section 4: 安全與刪除偏好 */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6">
         <div className="border-b border-slate-800 pb-4">
           <h3 className="text-base font-semibold text-slate-100 flex items-center gap-2">

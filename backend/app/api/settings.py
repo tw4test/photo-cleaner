@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from typing import Dict, Any, Optional
 import json
 
+from app.core.config import settings
 from app.core.database import get_db, SyncSessionLocal
 from app.models.schema import Setting
 from app.services.rules_engine import rules_engine
@@ -53,6 +54,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "clip_model": "ViT-B-16",           # 模型名稱
     "clip_pretrained": "openai",        # 預訓練權重
     "compute_device": "auto",           # 全域運算裝置預設：auto | cuda | cpu
+
+    # 分析階段並行 Runner 數目設定
+    "hash_runners": settings.HASH_RUNNERS,
+    "basic_runners": settings.BASIC_RUNNERS,
+    "clip_runners": settings.CLIP_RUNNERS,
+    "video_runners": settings.VIDEO_RUNNERS,
 }
 
 class SettingsUpdate(BaseModel):

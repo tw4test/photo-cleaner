@@ -194,6 +194,20 @@ async def get_analysis_status(db: AsyncSession = Depends(get_db)):
         "failed": video_failed,
     }
 
+    # ── runners 設定 ────────────────────────────────────────────────────────────
+    runners_data = {}
+    for stage_key in ("hash", "basic", "clip", "video"):
+        setting_key = f"{stage_key}_runners"
+        default_val = DEFAULT_SETTINGS.get(setting_key, 1)
+        try:
+            s_runner = await db.get(Setting, setting_key)
+            if s_runner:
+                runners_data[stage_key] = json.loads(s_runner.value)
+            else:
+                runners_data[stage_key] = default_val
+        except Exception:
+            runners_data[stage_key] = default_val
+
     return {
         "stages": {
             "hash": hash_stats,
@@ -204,6 +218,7 @@ async def get_analysis_status(db: AsyncSession = Depends(get_db)):
         "clip_model": clip_model,
         "clip_pretrained": clip_pretrained,
         "device": device,
+        "runners": runners_data,
     }
 
 

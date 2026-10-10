@@ -45,6 +45,7 @@ export const ScanProgressBar: React.FC<ScanProgressBarProps> = ({
     stage_label,
     current_stage,
     device_used,
+    current_runners,
     total_files,
     processed_files,
     percentage,
@@ -215,6 +216,11 @@ export const ScanProgressBar: React.FC<ScanProgressBarProps> = ({
                       : 'bg-slate-800 text-slate-300 border-slate-700'
                   }`}>
                     {device_used === 'cuda' ? '⚡ GPU (CUDA)' : '💻 CPU'}
+                  </span>
+                )}
+                {job_type === 'analyze' && current_runners && (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-mono bg-sky-950/80 text-sky-300 border border-sky-800/60 shadow-sm">
+                    ⚡ {current_runners} Runners
                   </span>
                 )}
               </div>

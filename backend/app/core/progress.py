@@ -22,6 +22,7 @@ class ProgressState(BaseModel):
     stage_label: str = "閒置中"
     current_stage: str = ""  # 正在執行的分析階段名稱
     device_used: str = ""    # 實際使用的運算裝置
+    current_runners: Optional[int] = None  # 目前執行階段使用的並行 Runner 數
     total_files: int = 0
     processed_files: int = 0
     percentage: float = 0.0
@@ -152,7 +153,7 @@ class ProgressTracker:
             self.state.device_used = device
             self._broadcast_internal()
 
-    def set_current_stage(self, stage_name: str, total: int = 0, label: str = ""):
+    def set_current_stage(self, stage_name: str, total: int = 0, label: str = "", runners: Optional[int] = None):
         stage_labels = {
             "hash": "正在計算檔案 SHA-256 雜湊 (Hash 階段)...",
             "basic": "正在生成縮圖與計算相片特徵 (Basic 階段)...",
@@ -163,6 +164,7 @@ class ProgressTracker:
             self.state.current_stage = stage_name
             self.state.stage = stage_name
             self.state.stage_label = label or stage_labels.get(stage_name, f"正在執行 {stage_name} 階段...")
+            self.state.current_runners = runners
             self.state.processed_files = 0
             self.state.total_files = total
             self.state.percentage = 0.0

@@ -33,6 +33,12 @@ export interface AnalysisStatus {
   clip_model: string
   clip_pretrained: string
   device: string
+  runners?: {
+    hash: number
+    basic: number
+    clip: number
+    video: number
+  }
 }
 
 export interface CudaInstallProgress {
@@ -83,6 +89,7 @@ export interface ScanProgressState {
   stage_label: string
   current_stage?: string
   device_used?: string
+  current_runners?: number
   total_files: number
   processed_files: number
   percentage: number
