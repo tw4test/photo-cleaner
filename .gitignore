@@ -81,3 +81,7 @@ ehthumbs.db
 .idea/
 *.swp
 *.swo
+
+# 文件用的截圖（上面的規則會擋掉所有圖片，這裡放行）
+!docs/images/
+!docs/images/*.png
