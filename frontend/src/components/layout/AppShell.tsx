@@ -78,7 +78,7 @@ export const AppShell = ({ children }: AppShellProps) => {
           {/* Logo / Brand */}
           {collapsed ? (
             <div className="flex flex-col items-center gap-3 border-b border-slate-800 py-4">
-              <div className="p-2 bg-sky-500/20 text-sky-400 rounded-lg border border-sky-500/30" title="相片瘦身">
+              <div className="p-2 bg-sky-500/20 text-sky-400 rounded-lg border border-sky-500/30" title="相片清理助手">
                 <ShieldCheck className="w-6 h-6" />
               </div>
               <button
@@ -98,7 +98,7 @@ export const AppShell = ({ children }: AppShellProps) => {
                   <ShieldCheck className="w-6 h-6" />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <h1 className="font-bold text-base text-slate-100 tracking-wide">相片瘦身</h1>
+                  <h1 className="font-bold text-base text-slate-100 tracking-wide">相片清理助手</h1>
                   <p className="text-xs text-slate-400 truncate">本地 AI 輔助清理工具</p>
                 </div>
                 <button
