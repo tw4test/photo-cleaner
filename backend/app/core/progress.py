@@ -1,12 +1,5 @@
 """
-全域任務進度追蹤器（掃描 / 分析 / 補算縮圖 / 評估共用）。
-
-v0.5 變更：
-- try_start_*()：在 endpoint 內原子化地「檢查 + 開始」，兩次快速點擊只會啟動一個任務。
-- request_cancel() 只設定旗標；is_running 要等背景任務真正結束（finish_cancelled /
-  complete / fail）才會變回 False，避免舊任務的執行緒還在跑時又啟動新任務。
-- SSE 廣播改為 thread-safe：worker 執行緒透過 loop.call_soon_threadsafe 推送，
-  每個訂閱者只保留最新一筆狀態，並節流到每秒約 5 次。
+全域任務進度追蹤器（掃描 / 分析 / 補算縮圖 / 評估共用）。v0.5
 """
 import asyncio
 import threading
@@ -15,22 +8,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel
 
-_BROADCAST_MIN_INTERVAL = 0.2  # 秒
+_BROADCAST_MIN_INTERVAL = 0.2
 
 
 class StageStats(BaseModel):
     pending: int = 0
     done: int = 0
     failed: int = 0
-    stale: int = 0   # clip 階段特有：過期（模型不符）
+    stale: int = 0
 
 
 class ProgressState(BaseModel):
     is_running: bool = False
-    job_type: str = "idle"   # idle | scan | analyze | rebuild_thumbs | evaluate
+    job_type: str = "idle"
     stage: str = "idle"
-    # idle | discovering | processing | evaluating_rules | completed | error
-    # analyze sub-stages: hash, basic, clip, video
     stage_label: str = "閒置中"
     current_stage: str = ""
     device_used: str = ""
@@ -48,6 +39,9 @@ class ProgressState(BaseModel):
     stage_stats: Dict[str, Any] = {}
     error_message: Optional[str] = None
     cancel_requested: bool = False
+    cancellable: bool = True          # 評估（規則引擎）一次完成、無法中途停止 → False
+    pipeline_step: str = ""           # 一鍵流水線目前步驟：scan | analyze | evaluate
+    evaluate_result: Dict[str, Any] = {}   # {skipped, added, removed, total}
     started_at: Optional[float] = None
     stage_started_at: Optional[float] = None
     finished_at: Optional[float] = None
@@ -55,7 +49,6 @@ class ProgressState(BaseModel):
 
 
 def _publish_latest(q: asyncio.Queue, data: Dict[str, Any]) -> None:
-    """只保留最新一筆狀態（在 event loop 執行緒內呼叫）。"""
     try:
         while not q.empty():
             q.get_nowait()
@@ -72,22 +65,14 @@ class ProgressTracker:
         self._lock = threading.RLock()
         self._last_broadcast = 0.0
 
-    # ─── 原子化開始 ──────────────────────────────────────────────────
     def try_start(self, job_type: str, stage: str, label: str, **fields) -> bool:
-        """若目前沒有任務在跑，立即標記為執行中並回傳 True；否則回傳 False。"""
         with self._lock:
             if self.state.is_running:
                 return False
             self._cancel_requested = False
             now = time.time()
-            self.state = ProgressState(
-                is_running=True,
-                job_type=job_type,
-                stage=stage,
-                stage_label=label,
-                started_at=now,
-                stage_started_at=now,
-            )
+            self.state = ProgressState(is_running=True, job_type=job_type, stage=stage, stage_label=label,
+                                       started_at=now, stage_started_at=now)
             for k, v in fields.items():
                 if hasattr(self.state, k):
                     setattr(self.state, k, v)
@@ -99,20 +84,28 @@ class ProgressTracker:
         return self.try_start("scan", "discovering", label)
 
     def try_start_analyze(self, stages: list, device: str = "auto") -> bool:
-        stage_names = {"hash": "檔案雜湊", "basic": "基本特徵與縮圖", "clip": "CLIP 語義向量", "video": "影片資訊"}
-        friendly = [stage_names.get(s, s) for s in stages]
-        return self.try_start(
-            "analyze", "pending", f"準備執行特徵分析（階段：{', '.join(friendly)}）...", device_used=device
-        )
+        names = {"hash": "檔案雜湊", "basic": "基本特徵與縮圖", "clip": "CLIP 語義向量", "video": "影片資訊"}
+        friendly = [names.get(s, s) for s in stages]
+        return self.try_start("analyze", "pending", f"準備執行特徵分析（階段：{', '.join(friendly)}）...",
+                              device_used=device)
 
     def try_start_rebuild_thumbs(self) -> bool:
         return self.try_start("rebuild_thumbs", "processing", "正在補算缺少的縮圖...")
 
     def try_start_evaluate(self) -> bool:
         return self.try_start("evaluate", "evaluating_rules", "正在執行規則引擎（識別截圖/文件/重複/廢片）...",
-                              percentage=99.0)
+                              percentage=99.0, cancellable=False)
 
-    # ─── 舊介面（仍可用；若已有任務在跑則拋出 RuntimeError）─────────────
+    def try_start_pipeline(self) -> bool:
+        return self.try_start("pipeline", "discovering", "一鍵流水線：準備掃描...", pipeline_step="scan")
+
+    def set_pipeline_step(self, step: str, label: str):
+        with self._lock:
+            self.state.pipeline_step = step
+            self.state.stage_label = label
+            self.state.cancellable = step != "evaluate"
+            self._broadcast_internal(force=True)
+
     def _start_job(self, job_type: str, stage: str, label: str):
         if not self.try_start(job_type, stage, label):
             raise RuntimeError("目前已有任務進行中")
@@ -131,12 +124,12 @@ class ProgressTracker:
 
     def set_evaluating_rules(self):
         with self._lock:
+            self.state.cancellable = False
             self.state.stage = "evaluating_rules"
             self.state.stage_label = "正在執行規則引擎（識別截圖/文件/重複/廢片）..."
             self.state.percentage = 99.0
             self._broadcast_internal(force=True)
 
-    # ─── 結束 ────────────────────────────────────────────────────────
     def _complete_job(self, label: str = "完成！", **extra):
         with self._lock:
             now = time.time()
@@ -174,7 +167,6 @@ class ProgressTracker:
             self._broadcast_internal(force=True)
 
     def ensure_finished(self):
-        """背景任務的 finally 區塊呼叫：若任務還標記為執行中，依情況收尾。"""
         with self._lock:
             if self.state.is_running:
                 if self._cancel_requested:
@@ -182,7 +174,6 @@ class ProgressTracker:
                 else:
                     self.fail_job("任務意外中止")
 
-    # ─── Scan ────────────────────────────────────────────────────────
     def set_scan_syncing(self, total: int):
         with self._lock:
             self.state.total_files = total
@@ -202,21 +193,13 @@ class ProgressTracker:
             self._broadcast_internal()
 
     def complete_scan(self, summary: dict):
-        """summary: {added, modified, missing, unchanged}"""
         added = summary.get("added", 0)
         total = sum(summary.values())
-        self._complete_job(
-            label=f"掃描完成！新增 {added} 個資產",
-            scan_summary=summary,
-            new_assets_count=added,
-            processed_files=total,
-            total_files=total,
-        )
+        self._complete_job(label=f"掃描完成！新增 {added} 個資產", scan_summary=summary,
+                           new_assets_count=added, processed_files=total, total_files=total)
 
-    # ─── Analyze ─────────────────────────────────────────────────────
-    def set_current_stage(self, stage_name: str, total: int = 0, label: str = "",
-                          runners: Optional[int] = None):
-        stage_labels = {
+    def set_current_stage(self, stage_name: str, total: int = 0, label: str = "", runners: Optional[int] = None):
+        labels = {
             "hash": "正在計算檔案 SHA-256 雜湊 (Hash 階段)...",
             "basic": "正在生成縮圖與計算相片特徵 (Basic 階段)...",
             "clip": "正在執行 AI 語義向量提取與零樣本分類 (CLIP 階段)...",
@@ -225,7 +208,7 @@ class ProgressTracker:
         with self._lock:
             self.state.current_stage = stage_name
             self.state.stage = stage_name
-            self.state.stage_label = label or stage_labels.get(stage_name, f"正在執行 {stage_name} 階段...")
+            self.state.stage_label = label or labels.get(stage_name, f"正在執行 {stage_name} 階段...")
             if runners is not None:
                 self.state.current_runners = runners
             self.state.processed_files = 0
@@ -254,7 +237,6 @@ class ProgressTracker:
             self._broadcast_internal()
 
     def update(self, count: int = 1, current_file: str = ""):
-        """通用增量進度推進。"""
         with self._lock:
             self.state.processed_files += count
             if current_file:
@@ -265,18 +247,27 @@ class ProgressTracker:
     def complete_analyze(self, results: dict, device_used: str = ""):
         self._complete_job(label="分析完成！", stage_stats=results, device_used=device_used)
 
-    # ─── Rebuild thumbs ──────────────────────────────────────────────
     def complete_rebuild_thumbs(self, done: int):
         self._complete_job(label=f"縮圖補算完成！共補算 {done} 張")
 
-    # ─── Evaluate ────────────────────────────────────────────────────
-    def complete_evaluate(self, new_candidates: int):
-        self._complete_job(
-            label=f"評估完成！找到 {new_candidates} 個候選資產",
-            new_candidates_count=new_candidates,
-        )
+    def complete_evaluate(self, new_candidates: int, result: Optional[Dict[str, Any]] = None):
+        result = result or {}
+        if result.get("skipped"):
+            label = f"評估結果已是最新，略過（共 {new_candidates} 個候選）"
+        elif result:
+            label = (f"評估完成！共 {new_candidates} 個候選（新增 {result.get('added', 0)}、"
+                     f"移除 {result.get('removed', 0)}）")
+        else:
+            label = f"評估完成！找到 {new_candidates} 個候選資產"
+        self._complete_job(label=label, new_candidates_count=new_candidates, evaluate_result=result)
 
-    # ─── 向下相容（舊 scan API 使用）────────────────────────────────
+    def complete_pipeline(self, scan_summary: dict, stage_stats: dict, new_candidates: int, result: dict):
+        self._complete_job(
+            label=(f"流水線完成！新增 {scan_summary.get('added', 0)} 個資產，共 {new_candidates} 個候選"
+                   f"（新增 {result.get('added', 0)}、移除 {result.get('removed', 0)}）"),
+            scan_summary=scan_summary, stage_stats=stage_stats, new_candidates_count=new_candidates,
+            evaluate_result=result, pipeline_step="done")
+
     def set_discovered_total(self, total: int):
         self.set_scan_syncing(total)
 
@@ -286,28 +277,28 @@ class ProgressTracker:
     def fail_scan(self, error: str):
         self.fail_job(error)
 
-    # ─── 取消 ────────────────────────────────────────────────────────
-    def request_cancel(self):
-        """只設定取消旗標；任務真正結束時才把 is_running 設回 False。"""
+    def request_cancel(self) -> bool:
+        """設定取消旗標。評估步驟無法中途停止，此時不接受取消並回傳 False（F-12）。"""
         with self._lock:
             if not self.state.is_running:
-                return
+                return False
+            if not self.state.cancellable:
+                return False
             self._cancel_requested = True
             self.state.cancel_requested = True
             self.state.stage_label = "取消中，等待目前工作完成..."
             self._broadcast_internal(force=True)
+            return True
 
     def is_cancel_requested(self) -> bool:
         return self._cancel_requested
 
-    # ─── 狀態查詢 ────────────────────────────────────────────────────
     def get_state(self) -> Dict[str, Any]:
         with self._lock:
             d = self.state.model_dump()
-            d["is_scanning"] = d["is_running"]  # 向下相容
+            d["is_scanning"] = d["is_running"]
             return d
 
-    # ─── 內部 ────────────────────────────────────────────────────────
     def _update_rate(self, processed: int, total: int):
         total = max(total, 1)
         self.state.percentage = min(round((processed / total) * 100, 1), 99.0)
@@ -331,7 +322,6 @@ class ProgressTracker:
             try:
                 loop.call_soon_threadsafe(_publish_latest, q, data)
             except RuntimeError:
-                # loop 已關閉
                 try:
                     self._subscribers.remove((loop, q))
                 except ValueError:
@@ -349,8 +339,7 @@ class ProgressTracker:
         try:
             yield self.get_state()
             while True:
-                data = await q.get()
-                yield data
+                yield await q.get()
         finally:
             try:
                 self._subscribers.remove(entry)
