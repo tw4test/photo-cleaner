@@ -10,14 +10,14 @@
 
 本地運行的相片庫清理工具，針對大型相片庫（約 10 萬張、300GB，可放在 NAS）設計。
 以 SHA-256、pHash、清晰度 / 亮度與 **CLIP 零樣本分類**找出完全重複、近似重複、連拍多餘、模糊、曝光不良、螢幕截圖、文件 / 收據、梗圖與誤拍相片；
-在審核工作台人工確認後，批次移至資源回收筒。
+在審核工作台人工確認（可預覽大圖）後，批次移至資源回收筒。
 
-目前版本：**v0.6.4**。各版本變更見 `CHANGELOG-v0.5.md`、`CHANGELOG-v0.6.md` … `CHANGELOG-v0.6.4.md`；
-規格書仍是 [`photo-cleaner-functional-spec-0.4.md`](photo-cleaner-functional-spec-0.4.md)，與較新變更紀錄不一致時，**以變更紀錄為準**。
+目前版本：**v0.6.5**。各版本變更見 `CHANGELOG-v0.5.md`、`CHANGELOG-v0.6.md` … `CHANGELOG-v0.6.5.md`。
+功能規格見 [`photo-cleaner-functional-spec-0.6.5.md`](photo-cleaner-functional-spec-0.6.5.md)（取代舊的 0.4）。
 
 ### 🛡️ 核心防護原則
 
-1. **只有「執行刪除」頁能動實體檔案**：審核、設定等頁面只改資料庫狀態。
+1. **只有「執行刪除」頁能動實體檔案**：審核、預覽、設定等頁面只改資料庫狀態。
 2. **預設移至資源回收筒**（`send2trash`）。介面一律使用資源回收筒；永久刪除只能透過 API，且必須帶 `confirm_text: "永久刪除"`；隔離資料夾模式尚未實作，後端會拒絕。
 3. **Keeper 保護**：完全重複 / 近似重複 / 連拍群組加入待刪時，後端強制至少保留一張。
    **例外**：螢幕截圖與文件 / 收據不受此保護（在審核頁該分類加入待刪，或對這兩個分類做批次處理時，整個群組都可以加入待刪）。
@@ -43,17 +43,18 @@ flowchart TD
         V["video：時長 / 解析度 / 編碼"]
     end
     Analyze --> Eval["3. 評估 Evaluate<br/>規則引擎產生候選 + Keeper"]
-    Eval --> Review["4. Review 審核（只改 DB）"]
+    Eval --> Review["4. Review 審核（只改 DB，可預覽大圖）"]
     Review --> Process["5. Process 執行刪除（回收筒）"]
 ```
 
 - **評估狀態追蹤**：相片庫、分析結果、會影響評估的設定都沒變時，評估會自動略過；有變更時，首頁與資料庫頁會提示「需要重新評估」，並顯示上次評估新增 / 移除了幾張。
-- **審核動作不會讓評估過期**（待刪 / 保留只是狀態）。
+- **審核動作不會讓評估過期**（待刪 / 保留只是狀態）；改執行緒數、CLIP 批次大小這類效能設定也不會。
 
 #### 💡 NAS 上的 I/O
 
 - **basic** 階段每張相片只解碼一次（JPEG 以 draft 降解析度解碼；RAW + JPG 直接用伴生 JPG；RAW 取內嵌預覽），同時寫縮圖與計算特徵。這一段會產生網路 I/O。
 - **clip** 階段優先讀取本地縮圖快取（`thumbs_cache/`）。basic 已完成時，clip 不需再讀取 NAS 原檔。
+- **預覽大圖**會讀取原檔（只在你開啟預覽時，且只讀那一張）；瀏覽器能直接顯示的格式（JPG / PNG / WebP…）原檔直接回傳。
 
 ### 🖥️ 介面
 
@@ -66,18 +67,27 @@ flowchart TD
 | 歷史記錄 | 歷次清理批次與明細 |
 | 系統設定 | 偵測規則與門檻、分析效能（見下方） |
 
+主選單可收合成 64px 的圖示欄；按 `[` 一次收合 / 展開所有側邊欄（專注模式，在審核頁會連審核篩選欄一起）。收合狀態會記住。
+
 #### 審核工作台
 
 - **後端分頁**：一次只載入 200 張，捲到底自動載入下一頁；統計（各分類張數 / 容量）在後端計算，10 萬筆候選也只有少量卡片在畫面上。
-- **分類**：全部、螢幕截圖、文件 / 收據、梗圖、誤拍、完全重複、近似重複、連拍、模糊、曝光不良、影片；側邊欄顯示每個分類的張數與容量。一張相片可能同時符合多個分類，所以分類加總可能大於「全部」。
+- **分類**：全部、螢幕截圖、文件 / 收據、梗圖、誤拍、完全重複、近似重複、連拍、模糊、曝光不良、影片；側邊欄顯示每個分類的張數與容量（可收合成只剩圖示與數量的窄欄）。一張相片可能同時符合多個分類，所以分類加總可能大於「全部」。
 - **檢視**：排序（分數 / 大小 / 群組 / 路徑）、顯示或隱藏建議保留的相片、AI 分類的分數門檻、卡片大小（3–8 欄）。
 - **選取與動作**：Shift 範圍選取；「選取符合條件的全部 N 張」會在後端依條件批次處理，先預覽（張數、容量、隨機 12 張縮圖）再確認，清單在預覽後變動時會被拒絕；批次動作永遠不碰建議保留的相片。
-- **復原**：每次狀態變更後可在 12 秒內復原（Ctrl+Z）。復原紀錄存在記憶體，後端重新啟動後失效。
-- **側邊欄**：主選單與篩選欄都可收合成窄欄（只留圖示與數量），按 `[` 一次收合 / 展開全部（專注模式）。收合狀態會記住。
+- **復原**：每次狀態變更後可在 12 秒內復原（Ctrl+Z，預覽開著時也可以）。復原紀錄存在記憶體，後端重新啟動後失效。
+- **預覽大圖**：雙擊卡片、縮圖右上角的放大鏡，或按空白鍵 / Enter。
+  - `←` `→` 沿著審核清單切換，快到尾端時自動載入下一頁，前後幾張會先載入。
+  - `D` / `K` / `R` 直接決定這一張並跳到下一張（只動這一張，不影響已選取的其他卡片；被「群組至少保留一張」擋下時留在原地並說明原因）。
+  - 點圖或按 `F`：適合視窗 ↔ 100%；`I`：顯示 / 隱藏資訊欄；`Esc`：關閉。
+  - 資訊欄：檔案資料、偵測原因與分數、重複群組的所有成員（縮圖、大小、解析度、清晰度）；點選成員可切換預覽比較畫質（不在清單裡的成員為「比對中」，只能看不能操作）。
+  - HEIC / TIFF / RAW / 影片會縮成最長邊 2560px 顯示（影片只看第一幀），畫面上會提示不是原始解析度。
 
 | 快速鍵 | 動作 |
 |---|---|
-| `D` / `K` / `R` | 加入待刪 / 排除保留 / 恢復候選 |
+| 雙擊 / `Space` / `Enter` | 預覽大圖（空白鍵預覽最後點選的那張） |
+| `←` `→` / `F` / `I` / `Esc` | 預覽中：切換 / 100% / 資訊欄 / 關閉 |
+| `D` / `K` / `R` | 加入待刪 / 排除保留 / 恢復候選（預覽中只動目前這一張） |
 | `Shift` + 點選 | 範圍選取 |
 | `Ctrl` + `A` | 選取已載入的相片（跳過建議保留） |
 | `Ctrl` + `Z` | 復原上一個動作 |
@@ -96,7 +106,7 @@ flowchart TD
 - 每張相片只屬於一個重複群組（依序：完全重複 → 近似重複 → 連拍）。
 - **近似重複**：`near_dup_method` 可選 `clip` / `phash` / `both` / `either`（預設 `either`：CLIP 或 pHash 任一符合；沒有 CLIP 向量的相片仍可用 pHash 找）。群組超過 `near_dup_max_group`（預設 50）時會逐步收緊門檻拆小。
 - **連拍**：拍攝時間（EXIF `DateTimeOriginal`）在時間視窗內且 CLIP 相似度達門檻，保留最清晰的一張；讀不到 EXIF 拍攝時間時（以檔案修改時間代替）不採用連拍規則。
-- **Keeper 排序**：近似重複 = 路徑優先度 → 清晰度 → 解析度 → 大小；連拍 = 清晰度優先。
+- **Keeper 挑選**：依 `keeper_strategy`（路徑優先序、清晰度、檔案大小等）；近似重複保留畫質最佳的一張，連拍保留最清晰的一張。
 - **模糊 / 曝光**：在「最長邊 1024px」的縮小圖上計算，門檻與相機解析度無關。**注意：模糊門檻的預設值 100 在改成 1024px 之後尚未重新校準**。
 
 ### 🤖 AI（CLIP）
@@ -141,7 +151,6 @@ flowchart TD
 | 連拍：時間視窗 / CLIP 相似度 | 2 秒 / 0.85 |
 | 模糊（Laplacian 變異數，1024px） | 100（未校準） |
 | 過暗 / 過曝（平均亮度） | 30 / 225 |
-| 極小影片（預設關閉） | 100 KB |
 
 #### 🚀 效能建議
 
@@ -186,7 +195,7 @@ npm run build    # 含 TypeScript 型別檢查
 
 ```powershell
 cd backend
-pytest                                    # 目前：149 passed、1 skipped（真實 CLIP 測試）
+pytest                                    # 真實 CLIP 測試預設略過（1 skipped）
 $env:PC_REAL_CLIP="1"; pytest -m real_clip -s     # 真實模型煙霧測試（會下載約 600MB）
 ```
 
@@ -207,6 +216,8 @@ $env:PC_FUNC_LIB="E:\PCTest"; pytest tests\test_functional.py -v
 | `/api/workflow/status` | 首頁 / 資料庫頁共用的流程狀態與主要分類 |
 | `/api/analysis/{status,failures}` | 各階段統計與失敗清單 |
 | `/api/candidates/{summary,page,batch-status,bulk-status,undo}` | 審核：統計、分頁、狀態變更、依條件批次（預覽 → 確認）、復原 |
+| `/api/candidates/preview/{asset_id}` | 預覽大圖（原檔或縮成最長邊 2560px 的 JPEG） |
+| `/api/candidates/group/{group_id}` | 重複群組的所有成員 |
 | `/api/process/{summary,execute,unqueue}` | 待刪清單與執行刪除 |
 | `/api/history/batches` | 清理歷史 |
 | `/api/settings`、`/meta`、`/reset` | 設定、預設值與範圍、還原預設 |
@@ -219,14 +230,15 @@ $env:PC_FUNC_LIB="E:\PCTest"; pytest tests\test_functional.py -v
 photo-cleaner/
 ├── backend/
 │   ├── app/
-│   │   ├── api/        # roots, jobs, scan(相容), analysis, candidates, process, history,
+│   │   ├── api/        # roots, jobs, scan(相容), analysis, candidates, preview, process, history,
 │   │   │               # settings, thumbnails, dashboard, system, workflow
 │   │   ├── core/       # config, defaults (設定唯一來源), settings_meta, database (WAL),
 │   │   │               # migration (user_version), progress (SSE), app_state
 │   │   ├── models/     # schema.py, enums.py
 │   │   ├── services/   # scanner, pairing, scan_job, analyze_job, hash/basic/clip/video_stage,
 │   │   │               # feature_pipeline, similarity, thumbnail, rules_engine, evaluation_state,
-│   │   │               # review_service, review_logic, deletion, stats_service, workflow_service, cuda_manager
+│   │   │               # review_service, review_logic, preview_service, deletion, stats_service,
+│   │   │               # workflow_service, cuda_manager
 │   │   ├── stubs/      # 名稱沿用歷史命名，內容為真實實作：clip_stub (open_clip), raw_stub (rawpy),
 │   │   │               # video_probe_stub (OpenCV), vector_stub (餘弦相似度索引)
 │   │   └── main.py
@@ -237,12 +249,12 @@ photo-cleaner/
 │   ├── pages/          # Dashboard, Library, Review, Process, History, Settings
 │   ├── components/     # layout/AppShell, common/(ScanProgressBar, CudaInstallModal),
 │   │                   # scan/(ScanPanel, AnalysisPanel, EvaluatePanel), workflow/WorkflowSteps,
-│   │                   # review/(ReviewCard, ConfirmDialog, reviewMeta)
+│   │                   # review/(ReviewCard, PreviewModal, ConfirmDialog, reviewMeta)
 │   ├── hooks/          # useScanProgress (SSE + 輪詢), useWorkflowStatus, useLayoutPref
 │   └── services/       # api.ts, types.ts, workflow.ts, settingsApi.ts, reviewApi.ts
-├── photo-cleaner-functional-spec-0.4.md
-├── CHANGELOG-v0.5.md … CHANGELOG-v0.6.4.md
-├── spec-update-scan-analysis.md   # 已併入 v0.4，保留作歷史紀錄
+├── photo-cleaner-functional-spec-0.6.5.md
+├── CHANGELOG-v0.5.md … CHANGELOG-v0.6.5.md
+├── spec-update-scan-analysis.md   # 已併入規格書，保留作歷史紀錄
 └── AGENT.md
 ```
 
@@ -251,8 +263,8 @@ photo-cleaner/
 - **Phase 4**：分類門檻校準（需要標記約 300 張）、截圖的解析度 / EXIF 輔助判斷、模糊門檻在 1024px 下重新定預設值。
 - **Phase 5**：NAS 上的安全刪除（隔離資料夾 + 還原、配對檔刪到一半的 partial 狀態）。
 - `services/deletion.py` 刪除前的最後一道防線仍會為每個群組擋下一張，尚未配合「螢幕截圖 / 文件不受 Keeper 保護」。
-- 審核工作台：群組並排檢視、切換 Keeper、大圖預覽與方向鍵游標尚未實作。
-- 規格書尚未更新到 v0.5 以後。
+- 預覽：尚未支援並排比較兩張、滾輪縮放 / 拖曳平移、影片播放。
+- 審核工作台：尚無「以群組為單位」的列表（一列一組、一鍵接受建議）。
 
 ---
 
@@ -262,14 +274,14 @@ photo-cleaner/
 
 A local app for cleaning up large photo libraries (about 100k photos / 300GB, local disk or NAS).
 It uses SHA-256, pHash, sharpness/brightness metrics and **CLIP zero-shot classification** to find exact duplicates, near duplicates, redundant burst shots, blurry or badly exposed shots, screenshots, documents/receipts, memes and accidental shots.
-You review them in the Review workbench, then batch-move them to the Recycle Bin.
+You review them in the Review workbench (with a full-size preview), then batch-move them to the Recycle Bin.
 
-Current version: **v0.6.4**. See `CHANGELOG-v0.5.md`, `CHANGELOG-v0.6.md` … `CHANGELOG-v0.6.4.md`.
-The full specification is [`photo-cleaner-functional-spec-0.4.md`](photo-cleaner-functional-spec-0.4.md) (Traditional Chinese); where it disagrees with a newer changelog, **the changelog wins**.
+Current version: **v0.6.5**. See `CHANGELOG-v0.5.md`, `CHANGELOG-v0.6.md` … `CHANGELOG-v0.6.5.md`.
+The functional specification is [`photo-cleaner-functional-spec-0.6.5.md`](photo-cleaner-functional-spec-0.6.5.md) (Traditional Chinese; it replaces the old 0.4).
 
 ### 🛡️ Core Safety Rules
 
-1. **Only the Process page touches files.** Review, Settings and the other pages change database state only.
+1. **Only the Process page touches files.** Review, Preview, Settings and the other pages change database state only.
 2. **Recycle Bin by default** (`send2trash`). The UI always uses the Recycle Bin. Permanent deletion is API-only and requires `confirm_text: "永久刪除"`. Quarantine mode is not implemented and is rejected by the backend.
 3. **Keeper protection.** When an exact / near-duplicate / burst group is queued, the backend always keeps at least one member.
    **Exception:** screenshots and documents/receipts are exempt (queue them from their own category, or bulk-process those categories, and a whole group may be queued).
@@ -292,14 +304,15 @@ Scan, Analyze and Evaluate are independent jobs. The Library page's one-click pi
    - `clip`: CLIP embedding and zero-shot scores, on GPU or CPU
    - `video`: duration, resolution and codec
 3. **Evaluate** runs the rules engine to build candidates and pick keepers.
-4. **Review** your candidates.
+4. **Review** your candidates (preview any photo at full size).
 5. **Process** the queued ones to delete them.
 
-**Evaluation tracking.** If the library, the analysis results and the settings that affect evaluation are unchanged, evaluation is skipped. Otherwise the Dashboard and Library pages show that a re-evaluation is needed, and how many photos the last run added / removed. Review actions (queue / keep) never make the evaluation stale.
+**Evaluation tracking.** If the library, the analysis results and the settings that affect evaluation are unchanged, evaluation is skipped. Otherwise the Dashboard and Library pages show that a re-evaluation is needed, and how many photos the last run added / removed. Review actions (queue / keep) and performance-only settings (thread counts, batch size) never make the evaluation stale.
 
 **NAS I/O.**
 - `basic` decodes each original once (JPEG via draft-mode decoding; RAW + JPG uses the companion JPG; RAW uses the embedded preview) and writes the thumbnail and features from that single read. This stage produces network I/O.
 - `clip` reads the local thumbnail cache first, so it does not re-read originals from the NAS once `basic` is done.
+- **Full-size preview** reads the original (only when you open it, and only that one photo). Formats browsers can show directly (JPG / PNG / WebP…) are returned as-is.
 
 ### 🖥️ UI
 
@@ -312,18 +325,27 @@ Scan, Analyze and Evaluate are independent jobs. The Library page's one-click pi
 | History | Past cleaning batches and details |
 | Settings | Detection rules and thresholds, analysis performance (see below) |
 
+The main menu collapses to a 64px icon rail; press `[` to collapse/expand all sidebars (focus mode — on the Review page this includes the filter panel). The state is remembered.
+
 #### Review workbench
 
 - **Server-side pagination.** 200 photos at a time, loaded as you scroll; per-category counts and sizes are computed by the backend, so even 100k candidates keep only a few cards on screen.
-- **Categories:** all, screenshots, documents/receipts, memes, mistouches, exact duplicates, near duplicates, bursts, blur, bad exposure, video; the sidebar shows count and size for each. A photo can match several categories, so category counts may add up to more than "all".
+- **Categories:** all, screenshots, documents/receipts, memes, mistouches, exact duplicates, near duplicates, bursts, blur, bad exposure, video; the sidebar shows count and size for each (it can collapse to a narrow rail of icons and counts). A photo can match several categories, so category counts may add up to more than "all".
 - **View:** sort (score / size / group / path), show or hide suggested keepers, a score threshold for AI categories, card size (3–8 columns).
 - **Selection and actions:** Shift range select. "Select all N matching" runs on the backend by filter: it first previews (count, size, 12 random thumbnails) and then asks for confirmation; it is refused if the list changed after the preview. Bulk actions never touch suggested keepers.
-- **Undo** for 12 seconds after each state change (Ctrl+Z). Undo records are kept in memory and are lost when the backend restarts.
-- **Sidebars:** the main menu and the filter panel each collapse to a narrow rail (icons and counts). Press `[` to collapse/expand them all (focus mode). The state is remembered.
+- **Undo** for 12 seconds after each state change (Ctrl+Z, also while the preview is open). Undo records are kept in memory and are lost when the backend restarts.
+- **Full-size preview:** double-click a card, click the magnifier on its thumbnail, or press Space / Enter.
+  - `←` `→` walk through the review list (the next page loads near the end; neighbouring photos are preloaded).
+  - `D` / `K` / `R` decide the current photo and jump to the next one (only that photo — your other selected cards are untouched; if the keep-one-per-group guard blocks it, you stay on the photo and see why).
+  - Click the image or press `F` to toggle fit-to-window ↔ 100%; `I` toggles the info panel; `Esc` closes.
+  - Info panel: file details, why it was detected and its score, and every member of its duplicate group (thumbnail, size, resolution, sharpness). Click a member to compare it at full size (members that are not in the current list open in read-only "comparing" mode).
+  - HEIC / TIFF / RAW / video are shown downscaled to at most 2560px on the longest side (video shows its first frame), with a notice that it is not the original resolution.
 
 | Key | Action |
 |---|---|
-| `D` / `K` / `R` | Queue for deletion / keep / restore to candidates |
+| Double-click / `Space` / `Enter` | Open the preview (Space opens the last clicked card) |
+| `←` `→` / `F` / `I` / `Esc` | In the preview: navigate / 100% / info panel / close |
+| `D` / `K` / `R` | Queue for deletion / keep / restore to candidates (in the preview: current photo only) |
 | `Shift` + click | Range select |
 | `Ctrl` + `A` | Select loaded photos (skips suggested keepers) |
 | `Ctrl` + `Z` | Undo the last action |
@@ -342,7 +364,7 @@ Scan, Analyze and Evaluate are independent jobs. The Library page's one-click pi
 - Each photo belongs to at most one duplicate group (in order: exact → near → burst).
 - **Near duplicates:** `near_dup_method` is `clip`, `phash`, `both` or `either` (default `either`: CLIP or pHash, so photos without CLIP vectors can still be found by pHash). Groups larger than `near_dup_max_group` (default 50) are split by tightening the threshold step by step.
 - **Bursts:** capture time (EXIF `DateTimeOriginal`) within the time window and CLIP similarity above the threshold; the sharpest photo is kept. If no EXIF capture time can be read (file modification time is used instead), the burst rule is not applied.
-- **Keeper order:** near duplicates = path priority → sharpness → resolution → size; bursts = sharpness first.
+- **Keeper choice:** follows `keeper_strategy` (path priority, sharpness, file size…); near duplicates keep the best-quality photo and bursts keep the sharpest one.
 - **Blur / exposure** are computed on a copy whose longest side is 1024px, so thresholds do not depend on camera resolution. **Note: the default blur threshold of 100 has not been re-calibrated since the move to 1024px.**
 
 ### 🤖 AI (CLIP)
@@ -381,7 +403,6 @@ Scan, Analyze and Evaluate are independent jobs. The Library page's one-click pi
 | Burst: time window / CLIP similarity | 2 s / 0.85 |
 | Blur (Laplacian variance, 1024px) | 100 (not calibrated) |
 | Under / over exposure (mean brightness) | 30 / 225 |
-| Tiny video (off by default) | 100 KB |
 
 - **Performance:**
   - Keep `THUMBS_CACHE_DIR` on a local SSD.
@@ -406,7 +427,7 @@ npm run dev        # http://127.0.0.1:5173
 npm run build      # includes the TypeScript type check
 
 # Tests
-cd backend; pytest      # currently: 149 passed, 1 skipped (real-CLIP test)
+cd backend; pytest      # the real-CLIP test is skipped by default (1 skipped)
 ```
 
 Real-model smoke test: `$env:PC_REAL_CLIP="1"; pytest -m real_clip -s` (downloads about 600MB).
@@ -421,6 +442,8 @@ Functional tests with a known-answer library: `python scripts/make_test_library.
 | `/api/workflow/status` | Workflow state and primary categories (Dashboard / Library) |
 | `/api/analysis/{status,failures}` | Per-stage statistics and failures |
 | `/api/candidates/{summary,page,batch-status,bulk-status,undo}` | Review: summary, pagination, state changes, filter-based bulk (preview → confirm), undo |
+| `/api/candidates/preview/{asset_id}` | Full-size preview (the original, or a JPEG with the longest side ≤ 2560px) |
+| `/api/candidates/group/{group_id}` | Every member of a duplicate group |
 | `/api/process/{summary,execute,unqueue}` | Queued list and deletion |
 | `/api/history/batches` | Cleaning history |
 | `/api/settings`, `/meta`, `/reset` | Settings, defaults and ranges, reset |
@@ -432,5 +455,5 @@ Functional tests with a known-answer library: `python scripts/make_test_library.
 - **Phase 4:** classification threshold calibration (needs about 300 labelled photos), resolution / EXIF hints for screenshots, a new blur default for 1024px.
 - **Phase 5:** NAS-safe deletion (quarantine + restore, half-deleted pairs).
 - The last guard in `services/deletion.py` still holds back one asset per group and does not yet honour the screenshot/document exemption.
-- Review workbench: side-by-side group view, switching the keeper, full-size preview and arrow-key navigation are not implemented.
-- The specification has not been updated beyond v0.4.
+- Preview: no side-by-side comparison of two photos, no wheel zoom / drag-to-pan, no video playback.
+- Review workbench: no group-level list yet (one row per group with a one-click "accept suggestion").
