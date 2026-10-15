@@ -1,16 +1,23 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
 import os
+from typing import List, Optional
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db, SyncSessionLocal
-from app.models.schema import Asset, Candidate, File
-from app.models.enums import AssetStatus, DeletionMode
+from app.core.progress import progress_tracker
+from app.models.schema import Asset, Candidate
+from app.models.enums import AssetStatus
 from app.services.deletion import deletion_service
+from app.services.thumbnail import thumb_key_args
 
 router = APIRouter(prefix="/api/process", tags=["process"])
+
+PERMANENT_CONFIRM_TEXT = "永久刪除"
+
 
 class QueuedItemResponse(BaseModel):
     asset_id: int
@@ -23,98 +30,75 @@ class QueuedItemResponse(BaseModel):
     reason: Optional[str] = None
     thumbnail_url: str
 
+
 class QueuedSummaryResponse(BaseModel):
     total_count: int
     total_size_bytes: int
     items: List[QueuedItemResponse]
 
+
 class ExecuteDeletionRequest(BaseModel):
     asset_ids: Optional[List[int]] = None
     mode: str = "trash"  # "trash" | "permanent"
     confirmed: bool = False
+    confirm_text: Optional[str] = None  # 永久刪除時必須等於「永久刪除」
 
-from sqlalchemy.orm import selectinload
 
 @router.get("/summary", response_model=QueuedSummaryResponse)
 async def get_queued_summary(db: AsyncSession = Depends(get_db)):
-    # 查詢所有處於 queued 狀態的資產
     query = (
         select(Asset, Candidate)
         .options(selectinload(Asset.files))
         .outerjoin(Candidate, Candidate.asset_id == Asset.id)
         .where(Asset.status == AssetStatus.QUEUED.value)
+        .order_by(Asset.id, Candidate.score.desc())
     )
-    result = await db.execute(query)
-    rows = result.all()
-
+    rows = (await db.execute(query)).all()
     total_size = 0
     items = []
-    seen_asset_ids = set()
-
+    seen = set()
     for asset, cand in rows:
-        if asset.id in seen_asset_ids:
+        if asset.id in seen:
             continue
-        seen_asset_ids.add(asset.id)
+        seen.add(asset.id)
         total_size += asset.size_total
-
-        filename = os.path.basename(asset.primary_path)
-        mtime_val = 0
-        if asset.files:
-            for f in asset.files:
-                if f.role == "primary":
-                    mtime_val = int(f.mtime)
-                    break
-            if not mtime_val and asset.files:
-                mtime_val = int(asset.files[0].mtime)
-
-        thumb_url = f"/api/thumbnails/{asset.id}"
-        if mtime_val > 0:
-            thumb_url += f"?v={mtime_val}"
-
+        mtime = thumb_key_args(asset)["mtime"]
         items.append(QueuedItemResponse(
             asset_id=asset.id,
-            filename=filename,
+            filename=os.path.basename(asset.primary_path),
             primary_path=asset.primary_path,
             media_type=asset.media_type,
             size_total=asset.size_total,
             paired_paths=asset.paired_paths or [],
             rule=cand.rule if cand else None,
             reason=cand.reason if cand else None,
-            thumbnail_url=thumb_url
+            thumbnail_url=f"/api/thumbnails/{asset.id}" + (f"?v={int(mtime)}" if mtime else ""),
         ))
+    return QueuedSummaryResponse(total_count=len(items), total_size_bytes=total_size, items=items)
 
-    return QueuedSummaryResponse(
-        total_count=len(items),
-        total_size_bytes=total_size,
-        items=items
-    )
 
 @router.post("/execute")
-async def execute_deletion(payload: ExecuteDeletionRequest):
-    # 二次確認校驗
+def execute_deletion(payload: ExecuteDeletionRequest):
     if not payload.confirmed:
         raise HTTPException(status_code=400, detail="必須確認勾選同意執行刪除")
-
+    if payload.mode not in ("trash", "permanent"):
+        raise HTTPException(status_code=400, detail=f"目前不支援的刪除模式：{payload.mode}")
+    if payload.mode == "permanent" and (payload.confirm_text or "").strip() != PERMANENT_CONFIRM_TEXT:
+        raise HTTPException(status_code=400, detail=f"永久刪除必須輸入確認文字「{PERMANENT_CONFIRM_TEXT}」")
+    if progress_tracker.state.is_running:
+        raise HTTPException(status_code=409, detail="分析或評估進行中，請完成後再執行刪除")
     with SyncSessionLocal() as session:
-        result = deletion_service.execute_deletion(
-            session=session,
-            asset_ids=payload.asset_ids,
-            mode=payload.mode
-        )
-    return result
+        return deletion_service.execute_deletion(session=session, asset_ids=payload.asset_ids, mode=payload.mode)
+
 
 @router.post("/unqueue")
-async def unqueue_items(asset_ids: List[int], target_state: str = "candidate"):
-    if target_state not in ["candidate", "kept"]:
+def unqueue_items(asset_ids: List[int] = Body(...), target_state: str = Query("candidate")):
+    if target_state not in ("candidate", "kept"):
         raise HTTPException(status_code=400, detail="不合法的目標狀態")
-
     with SyncSessionLocal() as session:
-        session.query(Asset).filter(Asset.id.in_(asset_ids)).update(
-            {"status": target_state}, synchronize_session=False
-        )
+        session.query(Asset).filter(Asset.id.in_(asset_ids), Asset.status == AssetStatus.QUEUED.value).update(
+            {"status": target_state}, synchronize_session=False)
         session.query(Candidate).filter(Candidate.asset_id.in_(asset_ids)).update(
-            {"state": target_state}, synchronize_session=False
-        )
+            {"state": target_state}, synchronize_session=False)
         session.commit()
-
     return {"status": "ok", "message": f"已將 {len(asset_ids)} 項移出待刪清單"}

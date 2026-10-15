@@ -1,7 +1,6 @@
 """
 資料庫版本管理與遷移模組。
 使用 SQLite PRAGMA user_version 追蹤版本，啟動時自動執行遷移。
-
 版本歷史：
   v1 → 初始版本（P1 版本）
   v2 → 掃描/分析拆分（spec-update-scan-analysis.md）
@@ -11,7 +10,6 @@
        - 新增 analysis_failures 表
        - assets.status 新增 'missing' 值（僅文件，DB 無 CHECK constraint）
 """
-
 import shutil
 import logging
 from datetime import datetime
@@ -31,7 +29,7 @@ def get_db_version(conn) -> int:
 
 def set_db_version(conn, version: int):
     # PRAGMA user_version 不支援 ? 參數綁定，直接格式化
-    conn.execute(f"PRAGMA user_version = {version}")
+    conn.execute(f"PRAGMA user_version = {int(version)}")
 
 
 def _backup_db(db_path: Path):
@@ -48,12 +46,8 @@ def _get_current_clip_model(conn) -> tuple[str, str]:
     """從 settings 表取得目前設定的 CLIP 模型名稱。"""
     try:
         import json
-        row_model = conn.execute(
-            "SELECT value FROM settings WHERE key='clip_model'"
-        ).fetchone()
-        row_pretrained = conn.execute(
-            "SELECT value FROM settings WHERE key='clip_pretrained'"
-        ).fetchone()
+        row_model = conn.execute("SELECT value FROM settings WHERE key='clip_model'").fetchone()
+        row_pretrained = conn.execute("SELECT value FROM settings WHERE key='clip_pretrained'").fetchone()
         model = json.loads(row_model[0]) if row_model else "ViT-B-16"
         pretrained = json.loads(row_pretrained[0]) if row_pretrained else "openai"
         return model, pretrained
@@ -74,6 +68,15 @@ def _table_exists(conn, table: str) -> bool:
     return row is not None
 
 
+def _has_user_data(conn) -> bool:
+    """資料庫是否已有任何資產（全新資料庫不需要備份）。"""
+    try:
+        row = conn.execute("SELECT 1 FROM assets LIMIT 1").fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
 def _migrate_v1_to_v2(conn, db_path: Optional[Path] = None):
     """
     v1 → v2 遷移：
@@ -85,22 +88,18 @@ def _migrate_v1_to_v2(conn, db_path: Optional[Path] = None):
     6. 建立 analysis_failures 表
     """
     logger.info("開始執行資料庫遷移 v1 → v2 ...")
-
-    # 1. 備份
-    if db_path:
+    # 1. 備份（全新資料庫略過）
+    if db_path and _has_user_data(conn):
         _backup_db(db_path)
-
     # 2. files.hash_state
     if not _column_exists(conn, "files", "hash_state"):
         conn.execute("ALTER TABLE files ADD COLUMN hash_state TEXT NOT NULL DEFAULT 'pending'")
         logger.info("已新增 files.hash_state 欄位")
-
     # 把已有 sha256 的主檔設為 done
     conn.execute(
         "UPDATE files SET hash_state='done' "
         "WHERE sha256 IS NOT NULL AND role='primary'"
     )
-
     # 3. clip_features 表
     if not _table_exists(conn, "clip_features"):
         conn.execute("""
@@ -116,7 +115,6 @@ def _migrate_v1_to_v2(conn, db_path: Optional[Path] = None):
             )
         """)
         logger.info("已建立 clip_features 表")
-
     # 4. 搬移現有 CLIP 資料（若 features 表有 clip_embedding 欄位）
     existing_clip_col = _column_exists(conn, "features", "clip_embedding")
     if existing_clip_col:
@@ -136,15 +134,12 @@ def _migrate_v1_to_v2(conn, db_path: Optional[Path] = None):
             WHERE clip_embedding IS NOT NULL
         """, (model, pretrained))
         logger.info(f"已搬移現有 CLIP 向量至 clip_features（model={model}）")
-
         # 5. 重建 features 表（移除 clip_embedding / zs_scores）
         _rebuild_features_table(conn)
-
     # 5b. 若 features 表已無 clip_embedding，仍需確認有 analyzed_at 欄位
     if not _column_exists(conn, "features", "analyzed_at"):
         conn.execute("ALTER TABLE features ADD COLUMN analyzed_at DATETIME")
         logger.info("已新增 features.analyzed_at 欄位")
-
     # 6. analysis_failures 表
     if not _table_exists(conn, "analysis_failures"):
         conn.execute("""
@@ -159,7 +154,6 @@ def _migrate_v1_to_v2(conn, db_path: Optional[Path] = None):
         conn.execute("CREATE INDEX IF NOT EXISTS ix_analysis_failures_asset_id ON analysis_failures(asset_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS ix_analysis_failures_stage ON analysis_failures(stage)")
         logger.info("已建立 analysis_failures 表")
-
     logger.info("資料庫遷移 v1 → v2 完成。")
 
 
@@ -211,11 +205,9 @@ def run_migrations(sync_engine, db_path: Optional[Path] = None):
         raw = conn.connection  # 取得底層 sqlite3 connection
         version = get_db_version(raw)
         logger.info(f"目前資料庫版本：v{version}，目標版本：v{CURRENT_VERSION}")
-
         if version < 2:
             _migrate_v1_to_v2(raw, db_path)
             set_db_version(raw, 2)
             raw.commit()
-
         if version == CURRENT_VERSION:
             logger.debug("資料庫版本已是最新，無需遷移。")

@@ -1,462 +1,553 @@
+"""
+偵測規則引擎（v0.5.1）
+
+規則：
+- 完全重複（SHA-256；相片/RAW 為 exact_dup，影片為 video_same_size）
+- 近似重複（CLIP 餘弦相似度 及/或 pHash 漢明距離，向量化 + union-find）
+- 連拍（拍攝時間在視窗內且 CLIP 相似度 ≥ 門檻）
+- 模糊、過暗、過曝、極小影片
+- AI 語義：螢幕截圖、文件/收據、梗圖、誤拍
+
+所有規則一律排除 deleted / missing 資產（missing 的檔案不可能是 Keeper）。
+評估後會保留使用者的 queued / kept 決定，並確保每個群組至少有一張不在待刪清單。
+"""
 import json
-from typing import List, Dict, Any, Optional
+import logging
+from collections import defaultdict
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+import numpy as np
 from sqlalchemy.orm import Session
-from sqlalchemy import select, and_
-import imagehash
 
-from app.core.config import settings
-from app.models.schema import Asset, File, Feature, ClipFeature, Candidate, Group, Root, Setting
-from app.models.enums import CandidateRule, CandidateState, GroupType
+from app.core.defaults import DEFAULT_SETTINGS, load_effective_settings
+from app.models.enums import CandidateRule, CandidateState, GroupType, INACTIVE_ASSET_STATUSES
+from app.models.schema import Asset, Candidate, ClipFeature, Feature, File, Group, Root
+from app.services import similarity
 
-DEFAULT_CONFIG: Dict[str, Any] = {
-    # 規則開關
-    "rule_exact_dup_enabled": True,
-    "rule_near_dup_enabled": True,
-    "rule_burst_enabled": True,
-    "rule_blur_enabled": True,
-    "rule_exposure_enabled": True,
-    "rule_screenshot_enabled": True,     # AI 截圖辨識 (預設開啟)
-    "rule_document_enabled": True,       # AI 文件/收據辨識 (預設開啟)
-    "rule_meme_enabled": True,           # AI 梗圖/迷因辨識 (預設開啟)
-    "rule_mistouch_enabled": True,       # AI 誤拍/廢片辨識 (預設開啟)
-    "rule_video_same_size_enabled": True,
-    "rule_video_tiny_enabled": False,
+logger = logging.getLogger(__name__)
 
-    # 門檻參數
-    "phash_threshold": 6,
-    "blur_threshold": 100.0,
-    "under_exposure_threshold": 30.0,
-    "over_exposure_threshold": 225.0,
-    "screenshot_threshold": 0.60,        # 截圖信心度門檻 (0.0~1.0)
-    "document_threshold": 0.55,          # 文件/收據信心度門檻 (0.0~1.0)
-    "meme_threshold": 0.65,              # 梗圖迷因信心度門檻 (0.0~1.0)
-    "mistouch_threshold": 0.55,          # 誤拍廢片信心度門檻 (0.0~1.0)
-    "burst_time_window_seconds": 2.0,
-    "burst_similarity_threshold": 0.85,
-    "video_tiny_threshold_kb": 100,
-    "cross_path_duplicates": True,
-}
+# 向下相容：舊程式碼 import DEFAULT_CONFIG
+DEFAULT_CONFIG: Dict[str, Any] = DEFAULT_SETTINGS
+
+_ACTIVE = Asset.status.notin_(list(INACTIVE_ASSET_STATUSES))
+
+_AI_RULES = [
+    # (rule, setting enable key, threshold key, zs keys, reason template)
+    (CandidateRule.SCREENSHOT, "rule_screenshot_enabled", "screenshot_threshold",
+     ("screenshot", "螢幕截圖", "截圖"), "AI 識別為螢幕截圖"),
+    (CandidateRule.DOCUMENT, "rule_document_enabled", "document_threshold",
+     ("document", "文件", "收據", "發票"), "AI 識別為文件/收據/筆記"),
+    (CandidateRule.MEME, "rule_meme_enabled", "meme_threshold",
+     ("meme", "梗圖", "迷因", "表情包"), "AI 識別為網路梗圖/表情包"),
+    (CandidateRule.MISTOUCH, "rule_mistouch_enabled", "mistouch_threshold",
+     ("mistouch", "誤拍", "廢片"), "AI 識別為誤拍/口袋黑畫面"),
+]
+
+
+def _emb(blob: Optional[bytes]) -> Optional[np.ndarray]:
+    if not blob:
+        return None
+    v = np.frombuffer(blob, dtype=np.float32)
+    n = float(np.linalg.norm(v))
+    if n == 0 or not np.isfinite(n):
+        return None
+    return v / n
+
 
 class RulesEngine:
-    """
-    偵測規則引擎：
-    - 完全重複 (Exact Duplicate)
-    - 近似重複 (Near Duplicate)
-    - 模糊相片 (Blur)
-    - 過曝 / 過暗 (Exposure)
-    - AI 內容語義分析 (CLIP Zero-Shot: 螢幕截圖, 文件收據, 梗圖迷因, 誤拍廢片)
-    - 影片大小重複 (Video Same Size)
-    - 保留最後一張防呆保護 (Keeper Protection)
-    """
+    # ─────────────────────────────────────────────
+    # 入口
+    # ─────────────────────────────────────────────
+    def evaluate_all_rules(self, session: Session) -> Dict[str, int]:
+        cfg = load_effective_settings(session)
 
-    def _get_active_config(self, session: Session) -> Dict[str, Any]:
-        """從資料庫載入最新設定"""
-        config = DEFAULT_CONFIG.copy()
-        db_settings = session.query(Setting).all()
-        for s in db_settings:
-            try:
-                config[s.key] = json.loads(s.value)
-            except Exception:
-                config[s.key] = s.value
-        return config
-
-    def evaluate_all_rules(self, session: Session):
-        """執行所有規則並生成候選資料（保留使用者已排入 queued 或 kept 的處置決定）"""
-        config = self._get_active_config(session)
-
-        # 1. 記錄使用者先前手動處置的資產狀態（queued 與 kept 絕不清除丟失）
-        preserved_states = {
-            c.asset_id: c.state
-            for c in session.query(Candidate.asset_id, Candidate.state)
+        preserved = {
+            aid: state for aid, state in session.query(Candidate.asset_id, Candidate.state)
             .filter(Candidate.state.in_([CandidateState.QUEUED.value, CandidateState.KEPT.value]))
             .all()
         }
-
-        # 2. 清除舊的候選記錄以利重新評估
-        session.query(Candidate).delete()
-        session.query(Group).delete()
+        # "fetch"：同時把已刪除的列從 session 的 identity map 移除，
+        # 避免新建的候選重用相同 ID 時出現 "Identity map already had an identity" 警告
+        session.query(Candidate).delete(synchronize_session="fetch")
+        session.query(Group).delete(synchronize_session="fetch")
         session.flush()
 
-        # 3. 執行完全重複規則 (Exact Duplicates)
-        if config.get("rule_exact_dup_enabled", True):
-            self._evaluate_exact_duplicates(session, config)
+        counts: Dict[str, int] = defaultdict(int)
+        grouped: Set[int] = set()          # 已在 exact 群組中的資產（不再參與近似/連拍，每個資產只屬於一個群組）
+        near_members: Set[int] = set()
 
-        # 4. 執行近似重複規則 (Near Duplicates via pHash)
-        if config.get("rule_near_dup_enabled", True):
-            self._evaluate_near_duplicates(session, config)
-
-        # 5. 執行單張質量缺陷規則 (Blur & Exposure)
-        self._evaluate_quality_rules(session, config)
-
-        # 6. 執行 AI 內容語義辨識 (CLIP Zero-Shot: 截圖/文件/梗圖/誤拍)
-        self._evaluate_ai_semantic_rules(session, config)
-
+        exact_members = self._evaluate_exact_duplicates(session, cfg, counts)
+        grouped |= exact_members
+        if cfg.get("rule_near_dup_enabled", True):
+            near_members = self._evaluate_near_duplicates(session, cfg, grouped, counts)
+        if cfg.get("rule_burst_enabled", True):
+            self._evaluate_bursts(session, cfg, grouped | near_members, counts)
+        self._evaluate_quality_rules(session, cfg, counts)
+        self._evaluate_video_rules(session, cfg, counts)
+        self._evaluate_ai_semantic_rules(session, cfg, counts)
         session.flush()
 
-        # 7. 恢復使用者原有的處置狀態 (queued / kept)
-        if preserved_states:
-            for aid, state in preserved_states.items():
-                session.query(Candidate).filter(Candidate.asset_id == aid).update(
-                    {"state": state}, synchronize_session=False
-                )
-
+        for aid, state in preserved.items():
+            session.query(Candidate).filter(Candidate.asset_id == aid).update(
+                {"state": state}, synchronize_session=False
+            )
+        session.flush()
+        restored = self._reconcile_keepers(session)
         session.commit()
+        logger.info("規則評估完成：%s（Keeper 還原 %d）", dict(counts), restored)
+        return dict(counts)
 
-    def _evaluate_exact_duplicates(self, session: Session, config: Dict[str, Any]):
-        """尋找 SHA-256 完全相同的檔案"""
-        files = (
-            session.query(File, Asset, Root)
+    # ─────────────────────────────────────────────
+    # 群組工具
+    # ─────────────────────────────────────────────
+    def _add_group(self, session: Session, gtype: str, rule: str, members: List[int], keeper: int,
+                   reasons: Dict[int, str], scores: Dict[int, float], keeper_reason: str,
+                   counts: Dict[str, int], keeper_score: float = 0.9):
+        group = Group(type=gtype, keeper_asset_id=keeper)
+        session.add(group)
+        session.flush()
+        for aid in members:
+            is_keeper = aid == keeper
+            session.add(Candidate(
+                asset_id=aid, rule=rule,
+                reason=keeper_reason if is_keeper else reasons.get(aid, ""),
+                score=keeper_score if is_keeper else scores.get(aid, 0.85),
+                group_id=group.id, is_keeper=is_keeper, state=CandidateState.CANDIDATE.value,
+            ))
+            if not is_keeper:
+                counts[rule] += 1
+        counts[f"{rule}_groups"] += 1
+
+    # ─────────────────────────────────────────────
+    # 1. 完全重複
+    # ─────────────────────────────────────────────
+    def _evaluate_exact_duplicates(self, session: Session, cfg: Dict[str, Any], counts) -> Set[int]:
+        """回傳所有被放進完全重複群組的資產 ID。"""
+        photo_on = cfg.get("rule_exact_dup_enabled", True)
+        video_on = cfg.get("rule_video_same_size_enabled", True)
+        if not (photo_on or video_on):
+            return set()
+        rows = (
+            session.query(File.sha256, File.mtime, Asset.id, Asset.media_type, Asset.size_total, Root.priority)
             .join(Asset, File.asset_id == Asset.id)
             .join(Root, Asset.root_id == Root.id)
-            .filter(File.role == "primary", File.sha256.isnot(None), Asset.status != "deleted")
+            .filter(File.role == "primary", File.sha256.isnot(None), _ACTIVE)
             .all()
         )
-
-        hash_groups: Dict[str, List[tuple[File, Asset, Root]]] = {}
-        for f, a, r in files:
-            hash_groups.setdefault(f.sha256, []).append((f, a, r))
-
-        for sha, group_items in hash_groups.items():
-            if len(group_items) < 2:
-                continue
-
-            group = Group(type=GroupType.EXACT.value)
-            session.add(group)
-            session.flush()
-
-            sorted_items = sorted(
-                group_items,
-                key=lambda x: (x[2].priority, -x[1].size_total, x[0].mtime)
-            )
-
-            keeper_file, keeper_asset, _ = sorted_items[0]
-            group.keeper_asset_id = keeper_asset.id
-
-            session.add(Candidate(
-                asset_id=keeper_asset.id,
-                rule=CandidateRule.EXACT_DUP.value,
-                reason="SHA-256 完全相同（建議保留最佳版本）",
-                score=1.0,
-                group_id=group.id,
-                is_keeper=True,
-                state=CandidateState.CANDIDATE.value
-            ))
-
-            for f, a, r in sorted_items[1:]:
-                session.add(Candidate(
-                    asset_id=a.id,
-                    rule=CandidateRule.EXACT_DUP.value,
-                    reason=f"SHA-256 完全相同（與 {keeper_file.path} 重複）",
-                    score=1.0,
-                    group_id=group.id,
-                    is_keeper=False,
-                    state=CandidateState.CANDIDATE.value
-                ))
-
-    def _evaluate_near_duplicates(self, session: Session, config: Dict[str, Any]):
-        """利用 pHash 感知雜湊距離分組尋找近似圖片"""
-        phash_threshold = int(config.get("phash_threshold", 6))
-
-        existing_candidate_asset_ids = {
-            c.asset_id for c in session.query(Candidate.asset_id).all()
-        }
-
-        features = (
-            session.query(Feature, Asset, Root)
-            .join(Asset, Feature.asset_id == Asset.id)
-            .join(Root, Asset.root_id == Root.id)
-            .filter(
-                Feature.phash.isnot(None),
-                Asset.status != "deleted",
-                ~Asset.id.in_(existing_candidate_asset_ids) if existing_candidate_asset_ids else True
-            )
-            .all()
-        )
-
-        matched_pairs: List[tuple[int, int, int]] = []
-        for i in range(len(features)):
-            feat1, a1, r1 = features[i]
-            try:
-                h1 = imagehash.hex_to_hash(feat1.phash)
-            except Exception:
-                continue
-
-            for j in range(i + 1, len(features)):
-                feat2, a2, r2 = features[j]
-                try:
-                    h2 = imagehash.hex_to_hash(feat2.phash)
-                    dist = h1 - h2
-                    if dist <= phash_threshold:
-                        matched_pairs.append((i, j, dist))
-                except Exception:
-                    continue
-
-        clusters: List[set[int]] = []
-        for i, j, _ in matched_pairs:
-            found = False
-            for cl in clusters:
-                if i in cl or j in cl:
-                    cl.add(i)
-                    cl.add(j)
-                    found = True
-                    break
-            if not found:
-                clusters.append({i, j})
-
-        for cl in clusters:
-            items = [features[idx] for idx in cl]
+        by_sha: Dict[str, list] = defaultdict(list)
+        for r in rows:
+            by_sha[r.sha256].append(r)
+        members_out: Set[int] = set()
+        for sha, items in by_sha.items():
             if len(items) < 2:
                 continue
+            is_video = items[0].media_type == "video"
+            if (is_video and not video_on) or (not is_video and not photo_on):
+                continue
+            items.sort(key=lambda r: (r.priority, -r.size_total, r.mtime, r.id))
+            keeper = items[0].id
+            rule = CandidateRule.VIDEO_SAME_SIZE.value if is_video else CandidateRule.EXACT_DUP.value
+            gtype = GroupType.VIDEO_SIZE.value if is_video else GroupType.EXACT.value
+            members = [r.id for r in items]
+            reasons = {r.id: "SHA-256 完全相同（與保留版本重複）" for r in items}
+            scores = {r.id: 1.0 for r in items}
+            self._add_group(session, gtype, rule, members, keeper, reasons, scores,
+                            "SHA-256 完全相同（建議保留此版本）", counts, keeper_score=1.0)
+            members_out.update(members)
+        return members_out
 
-            group = Group(type=GroupType.NEAR.value)
-            session.add(group)
-            session.flush()
+    # ─────────────────────────────────────────────
+    # 2. 近似重複
+    # ─────────────────────────────────────────────
+    def _load_photo_vectors(self, session: Session, cfg: Dict[str, Any], exclude: Set[int]):
+        """回傳 (資產資訊 list, emb 或 None 的 list, phash list)。"""
+        model, pretrained = cfg.get("clip_model"), cfg.get("clip_pretrained")
+        rows = (
+            session.query(Asset.id, Asset.size_total, Root.priority, Feature.phash, Feature.blur_score,
+                          Feature.width, Feature.height, Feature.taken_at, Feature.exif, Feature.decode_status,
+                          ClipFeature.embedding, ClipFeature.model, ClipFeature.pretrained)
+            .join(Root, Asset.root_id == Root.id)
+            .outerjoin(Feature, Feature.asset_id == Asset.id)
+            .outerjoin(ClipFeature, ClipFeature.asset_id == Asset.id)
+            .filter(Asset.media_type.in_(["photo", "raw"]), _ACTIVE)
+            .all()
+        )
+        infos, embs, phashes = [], [], []
+        stale = 0
+        for r in rows:
+            if r.id in exclude:
+                continue
+            emb = None
+            if r.embedding is not None:
+                if r.model == model and r.pretrained == pretrained:
+                    emb = _emb(r.embedding)
+                else:
+                    stale += 1
+            ph = r.phash if (r.decode_status == "ok" and r.phash) else None
+            if emb is None and ph is None:
+                continue
+            infos.append(r)
+            embs.append(emb)
+            phashes.append(ph)
+        if stale:
+            logger.warning("有 %d 張相片的 CLIP 向量來自舊模型，評估時已排除（請重跑 CLIP 階段）", stale)
+        return infos, embs, phashes
 
-            sorted_items = sorted(
-                items,
-                key=lambda x: (x[2].priority, -(x[0].blur_score or 0.0), -x[1].size_total)
-            )
+    def _edges(self, embs: List[Optional[np.ndarray]], phashes: List[Optional[str]], method: str,
+               clip_thr: float, ph_thr: int):
+        """回傳 (ei, ej, sim, dist, E, has_c, has_p, H)；sim 無資料為 nan、dist 無資料為 -1。"""
+        n = len(embs)
+        dim = next((e.shape[0] for e in embs if e is not None), 0)
+        has_c = np.array([e is not None for e in embs], dtype=bool)
+        has_p = np.array([p is not None for p in phashes], dtype=bool)
+        E = np.zeros((n, max(dim, 1)), dtype=np.float32)
+        for k, e in enumerate(embs):
+            if e is not None:
+                E[k] = e
+        H = np.zeros(n, dtype=np.uint64)
+        if has_p.any():
+            H[has_p] = similarity.phash_hex_to_u64([p for p in phashes if p is not None])
 
-            keeper_feat, keeper_asset, _ = sorted_items[0]
-            group.keeper_asset_id = keeper_asset.id
+        parts_i, parts_j = [], []
+        if method in ("clip", "both", "either") and has_c.sum() >= 2:
+            idx = np.flatnonzero(has_c)
+            i, j, _ = similarity.clip_pairs(E[idx], clip_thr)
+            parts_i.append(idx[i]); parts_j.append(idx[j])
+        if method in ("phash", "either") and has_p.sum() >= 2:
+            idx = np.flatnonzero(has_p)
+            i, j, _ = similarity.phash_pairs(H[idx], ph_thr)
+            parts_i.append(idx[i]); parts_j.append(idx[j])
+        if not parts_i:
+            e = np.empty(0, np.int64)
+            return e, e, np.empty(0, np.float32), np.empty(0, np.int16), E, has_c, has_p, H
+        ei = np.concatenate(parts_i).astype(np.int64)
+        ej = np.concatenate(parts_j).astype(np.int64)
+        a, b = np.minimum(ei, ej), np.maximum(ei, ej)
+        _, first = np.unique(a * n + b, return_index=True)
+        ei, ej = a[first], b[first]
+        both_c = has_c[ei] & has_c[ej]
+        sim = np.full(len(ei), np.nan, dtype=np.float32)
+        if both_c.any():
+            sim[both_c] = similarity.pair_cosine(E, ei[both_c], ej[both_c])
+        both_p = has_p[ei] & has_p[ej]
+        dist = np.full(len(ei), -1, dtype=np.int16)
+        if both_p.any():
+            dist[both_p] = similarity.popcount64(H[ei[both_p]] ^ H[ej[both_p]])
+        return ei, ej, sim, dist, E, has_c, has_p, H
 
-            session.add(Candidate(
-                asset_id=keeper_asset.id,
-                rule=CandidateRule.NEAR_DUP.value,
-                reason="近似圖片（清晰度較佳，建議保留）",
-                score=0.9,
-                group_id=group.id,
-                is_keeper=True,
-                state=CandidateState.CANDIDATE.value
-            ))
+    @staticmethod
+    def _edge_mask(method: str, sim: np.ndarray, dist: np.ndarray, clip_thr: float, ph_thr: int) -> np.ndarray:
+        with np.errstate(invalid="ignore"):
+            pc = np.nan_to_num(sim, nan=-2.0) >= clip_thr
+        pp = (dist >= 0) & (dist <= ph_thr)
+        if method == "clip":
+            return pc
+        if method == "phash":
+            return pp
+        if method == "both":
+            return pc & pp
+        return pc | pp
 
-            for feat, a, r in sorted_items[1:]:
-                session.add(Candidate(
-                    asset_id=a.id,
-                    rule=CandidateRule.NEAR_DUP.value,
-                    reason="近似圖片（建議刪除較模糊副本）",
-                    score=0.85,
-                    group_id=group.id,
-                    is_keeper=False,
-                    state=CandidateState.CANDIDATE.value
-                ))
+    def _evaluate_near_duplicates(self, session: Session, cfg: Dict[str, Any], exclude: Set[int],
+                                  counts) -> Set[int]:
+        method = cfg.get("near_dup_method", "either")
+        clip_thr = float(cfg.get("clip_dup_threshold", 0.95))
+        ph_thr = int(cfg.get("phash_threshold", 6))
+        cap = int(cfg.get("near_dup_max_group", 50))
+        infos, embs, phashes = self._load_photo_vectors(session, cfg, exclude)
+        if len(infos) < 2:
+            return set()
+        ei, ej, sim, dist, E, has_c, has_p, H = self._edges(embs, phashes, method, clip_thr, ph_thr)
+        base = self._edge_mask(method, sim, dist, clip_thr, ph_thr)
+        ei, ej, sim, dist = ei[base], ej[base], sim[base], dist[base]
+        comps = similarity.components(range(len(infos)), ei, ej)
 
-    def _evaluate_quality_rules(self, session: Session, config: Dict[str, Any]):
-        """評估單張圖片質量：模糊、過曝、過暗"""
-        blur_enabled = config.get("rule_blur_enabled", True)
-        exposure_enabled = config.get("rule_exposure_enabled", True)
-        blur_threshold = float(config.get("blur_threshold", 100.0))
-        under_exp_threshold = float(config.get("under_exposure_threshold", 30.0))
-        over_exp_threshold = float(config.get("over_exposure_threshold", 225.0))
+        def tighter(level: int) -> np.ndarray:
+            return self._edge_mask(method, sim, dist, min(0.999, clip_thr + 0.01 * level),
+                                   max(0, ph_thr - level))
 
-        features = (
-            session.query(Feature, Asset)
+        final: List[List[int]] = []
+        for c in comps:
+            final.extend(similarity.split_large_component(c, ei, ej, tighter, cap))
+
+        members_out: Set[int] = set()
+        for comp in final:
+            def keeper_key(k):
+                r = infos[k]
+                return (r.priority, -(r.blur_score or 0.0), -((r.width or 0) * (r.height or 0)),
+                        -r.size_total, r.id)
+            ordered = sorted(comp, key=keeper_key)
+            kk = ordered[0]
+            keeper = infos[kk].id
+            reasons, scores = {}, {}
+            for k in ordered[1:]:
+                aid = infos[k].id
+                if has_c[k] and has_c[kk]:
+                    s = float(E[k] @ E[kk])
+                    reasons[aid] = f"與保留版本外觀相似（CLIP 相似度 {s:.3f}）"
+                    scores[aid] = round(s, 3)
+                elif has_p[k] and has_p[kk]:
+                    d = int(similarity.popcount64(np.array([H[k] ^ H[kk]], dtype=np.uint64))[0])
+                    reasons[aid] = f"與保留版本外觀相似（pHash 距離 {d}）"
+                    scores[aid] = round(1 - d / 64, 3)
+                else:
+                    reasons[aid] = "與群組內其他相片外觀相似"
+                    scores[aid] = 0.85
+            self._add_group(session, GroupType.NEAR.value, CandidateRule.NEAR_DUP.value,
+                            [infos[k].id for k in ordered], keeper, reasons, scores,
+                            "近似相片中畫質最佳（建議保留）", counts)
+            members_out.update(infos[k].id for k in comp)
+        return members_out
+
+    # ─────────────────────────────────────────────
+    # 3. 連拍
+    # ─────────────────────────────────────────────
+    def _evaluate_bursts(self, session: Session, cfg: Dict[str, Any], exclude: Set[int], counts):
+        window = float(cfg.get("burst_time_window_seconds", 2.0))
+        thr = float(cfg.get("burst_similarity_threshold", 0.85))
+        cap = int(cfg.get("near_dup_max_group", 50))
+        infos, embs, _ = self._load_photo_vectors(session, cfg, exclude)
+        items = [
+            (k, r) for k, r in enumerate(infos)
+            if embs[k] is not None and r.taken_at is not None
+            and not ((r.exif or {}).get("_taken_at_source") == "mtime")
+        ]
+        if len(items) < 2:
+            return
+        items.sort(key=lambda kr: kr[1].taken_at)
+        ts = np.array([r.taken_at.timestamp() for _, r in items])
+        ks = [k for k, _ in items]
+        ei, ej, sims = [], [], []
+        for a in range(len(items)):
+            b = a + 1
+            while b < len(items) and ts[b] - ts[a] <= window:
+                s = float(embs[ks[a]] @ embs[ks[b]])
+                if s >= thr:
+                    ei.append(ks[a]); ej.append(ks[b]); sims.append(s)
+                b += 1
+        if not ei:
+            return
+        ei_a, ej_a, sim_a = np.array(ei), np.array(ej), np.array(sims, dtype=np.float32)
+        comps = similarity.components(range(len(infos)), ei_a, ej_a)
+
+        def tighter(level: int) -> np.ndarray:
+            return sim_a >= min(0.999, thr + 0.02 * level)
+
+        final: List[List[int]] = []
+        for c in comps:
+            final.extend(similarity.split_large_component(c, ei_a, ej_a, tighter, cap))
+        for comp in final:
+            ordered = sorted(comp, key=lambda k: (-(infos[k].blur_score or 0.0), infos[k].priority,
+                                                  -infos[k].size_total, infos[k].id))
+            kk = ordered[0]
+            keeper = infos[kk].id
+            reasons, scores = {}, {}
+            for k in ordered[1:]:
+                s = float(embs[k] @ embs[kk])
+                reasons[infos[k].id] = f"連拍多餘（清晰度較低，與最佳張相似度 {s:.3f}）"
+                scores[infos[k].id] = round(s, 3)
+            self._add_group(session, GroupType.BURST.value, CandidateRule.BURST.value,
+                            [infos[k].id for k in ordered], keeper, reasons, scores,
+                            "連拍中最清晰（建議保留）", counts)
+
+    # ─────────────────────────────────────────────
+    # 4. 畫質
+    # ─────────────────────────────────────────────
+    def _evaluate_quality_rules(self, session: Session, cfg: Dict[str, Any], counts):
+        blur_on = cfg.get("rule_blur_enabled", True)
+        exp_on = cfg.get("rule_exposure_enabled", True)
+        if not (blur_on or exp_on):
+            return
+        blur_thr = float(cfg.get("blur_threshold", 100.0))
+        under = float(cfg.get("under_exposure_threshold", 30.0))
+        over = float(cfg.get("over_exposure_threshold", 225.0))
+        rows = (
+            session.query(Feature.asset_id, Feature.blur_score, Feature.brightness)
             .join(Asset, Feature.asset_id == Asset.id)
-            .filter(Asset.status != "deleted")
+            .filter(_ACTIVE, Feature.decode_status == "ok")
             .all()
         )
-
-        for feat, asset in features:
-            # 1. 模糊檢查
-            if blur_enabled and feat.blur_score is not None and feat.blur_score < blur_threshold:
+        for aid, blur, bright in rows:
+            if blur_on and blur is not None and blur_thr > 0 and blur < blur_thr:
                 session.add(Candidate(
-                    asset_id=asset.id,
-                    rule=CandidateRule.BLUR.value,
-                    reason=f"相片模糊（清晰度分數 {feat.blur_score:.1f} < 門檻 {blur_threshold:.0f}）",
-                    score=round(1.0 - (feat.blur_score / blur_threshold), 2),
-                    group_id=None,
-                    is_keeper=False,
-                    state=CandidateState.CANDIDATE.value
-                ))
+                    asset_id=aid, rule=CandidateRule.BLUR.value,
+                    reason=f"相片模糊（清晰度分數 {blur:.1f} < 門檻 {blur_thr:.0f}）",
+                    score=round(1.0 - (blur / blur_thr), 2), state=CandidateState.CANDIDATE.value))
+                counts["blur"] += 1
+            if exp_on and bright is not None:
+                if under > 0 and bright < under:
+                    session.add(Candidate(
+                        asset_id=aid, rule=CandidateRule.UNDER_EXPOSURE.value,
+                        reason=f"相片過暗（平均亮度 {bright:.1f} < 門檻 {under:.0f}）",
+                        score=round(1.0 - (bright / under), 2), state=CandidateState.CANDIDATE.value))
+                    counts["under_exposure"] += 1
+                elif bright > over and over < 255:
+                    session.add(Candidate(
+                        asset_id=aid, rule=CandidateRule.OVER_EXPOSURE.value,
+                        reason=f"相片過曝（平均亮度 {bright:.1f} > 門檻 {over:.0f}）",
+                        score=round((bright - over) / (255 - over), 2), state=CandidateState.CANDIDATE.value))
+                    counts["over_exposure"] += 1
 
-            # 2. 過暗檢查
-            if exposure_enabled and feat.brightness is not None and feat.brightness < under_exp_threshold:
-                session.add(Candidate(
-                    asset_id=asset.id,
-                    rule=CandidateRule.UNDER_EXPOSURE.value,
-                    reason=f"相片過暗（平均亮度 {feat.brightness:.1f} < 門檻 {under_exp_threshold:.0f}）",
-                    score=round(1.0 - (feat.brightness / under_exp_threshold), 2),
-                    group_id=None,
-                    is_keeper=False,
-                    state=CandidateState.CANDIDATE.value
-                ))
-            # 3. 過曝檢查
-            elif exposure_enabled and feat.brightness is not None and feat.brightness > over_exp_threshold:
-                session.add(Candidate(
-                    asset_id=asset.id,
-                    rule=CandidateRule.OVER_EXPOSURE.value,
-                    reason=f"相片過曝（平均亮度 {feat.brightness:.1f} > 門檻 {over_exp_threshold:.0f}）",
-                    score=round((feat.brightness - over_exp_threshold) / (255 - over_exp_threshold), 2),
-                    group_id=None,
-                    is_keeper=False,
-                    state=CandidateState.CANDIDATE.value
-                ))
+    # ─────────────────────────────────────────────
+    # 5. 影片
+    # ─────────────────────────────────────────────
+    def _evaluate_video_rules(self, session: Session, cfg: Dict[str, Any], counts):
+        if not cfg.get("rule_video_tiny_enabled", False):
+            return
+        limit = int(cfg.get("video_tiny_threshold_kb", 100)) * 1024
+        rows = session.query(Asset.id, Asset.size_total).filter(
+            Asset.media_type == "video", _ACTIVE, Asset.size_total < limit).all()
+        for aid, size in rows:
+            session.add(Candidate(
+                asset_id=aid, rule=CandidateRule.VIDEO_TINY.value,
+                reason=f"影片極小（{size / 1024:.0f} KB < {limit // 1024} KB），可能是誤錄",
+                score=0.7, state=CandidateState.CANDIDATE.value))
+            counts["video_tiny"] += 1
 
-    def _evaluate_ai_semantic_rules(self, session: Session, config: Dict[str, Any]):
-        """
-        評估 AI 內容語義分類：螢幕截圖、文件收據、梗圖迷因、誤拍廢片。
-
-        A-17：只使用與目前設定相同模型的 CLIP 向量；
-        若有資產的向量模型不符（過期），計數後記錄日誌，不混用。
-        """
-        screenshot_enabled = config.get("rule_screenshot_enabled", True)
-        document_enabled = config.get("rule_document_enabled", True)
-        meme_enabled = config.get("rule_meme_enabled", True)
-        mistouch_enabled = config.get("rule_mistouch_enabled", True)
-
-        screenshot_th = float(config.get("screenshot_threshold", 0.60))
-        document_th = float(config.get("document_threshold", 0.55))
-        meme_th = float(config.get("meme_threshold", 0.65))
-        mistouch_th = float(config.get("mistouch_threshold", 0.55))
-
-        # A-17: 取得目前設定的 CLIP 模型
-        current_clip_model = config.get("clip_model", "ViT-B-16")
-        current_clip_pretrained = config.get("clip_pretrained", "openai")
-
-        # 取得所有活躍資產的 ClipFeature（僅限目前模型，A-17）
-        clip_features = (
-            session.query(ClipFeature, Asset)
+    # ─────────────────────────────────────────────
+    # 6. AI 語義
+    # ─────────────────────────────────────────────
+    def _evaluate_ai_semantic_rules(self, session: Session, cfg: Dict[str, Any], counts):
+        enabled = [(r, cfg.get(th, DEFAULT_SETTINGS[th]), keys, text) for r, en, th, keys, text in _AI_RULES
+                   if cfg.get(en, True)]
+        if not enabled:
+            return
+        model, pretrained = cfg.get("clip_model"), cfg.get("clip_pretrained")
+        rows = (
+            session.query(ClipFeature.asset_id, ClipFeature.zs)
             .join(Asset, ClipFeature.asset_id == Asset.id)
-            .filter(
-                Asset.status != "deleted",
-                ClipFeature.model == current_clip_model,
-                ClipFeature.pretrained == current_clip_pretrained,
-                ClipFeature.zs.isnot(None),
-            )
+            .filter(_ACTIVE, ClipFeature.model == model, ClipFeature.pretrained == pretrained,
+                    ClipFeature.zs.isnot(None))
             .all()
         )
+        for aid, raw in rows:
+            zs = raw
+            if isinstance(raw, str):
+                try:
+                    zs = json.loads(raw)
+                except Exception:
+                    zs = {}
+            if not isinstance(zs, dict):
+                continue
+            normal = float(zs.get("normal_photo", 0.0))
+            for rule, thr, keys, text in enabled:
+                score = next((float(zs[k]) for k in keys if k in zs), None)
+                if score is None:
+                    continue
+                if score >= float(thr) and score > normal:
+                    session.add(Candidate(
+                        asset_id=aid, rule=rule.value,
+                        reason=f"{text}（信心度 {int(score * 100)}% ≥ 門檻 {int(float(thr) * 100)}%）",
+                        score=score, state=CandidateState.CANDIDATE.value))
+                    counts[rule.value] += 1
 
-        # 計算過期（模型不符）的資產數量，提示用戶
-        stale_count = (
-            session.query(ClipFeature)
-            .join(Asset, ClipFeature.asset_id == Asset.id)
-            .filter(
-                Asset.status != "deleted",
-                (ClipFeature.model != current_clip_model) |
-                (ClipFeature.pretrained != current_clip_pretrained),
-            )
-            .count()
+    # ─────────────────────────────────────────────
+    # Keeper 保護
+    # ─────────────────────────────────────────────
+    def _group_members(self, session: Session, group_ids: Iterable[int]) -> Dict[int, List[Tuple[int, bool, str]]]:
+        group_ids = list(set(group_ids))
+        out: Dict[int, List[Tuple[int, bool, str]]] = defaultdict(list)
+        if not group_ids:
+            return out
+        seen = set()
+        rows = (
+            session.query(Candidate.group_id, Candidate.asset_id, Candidate.is_keeper, Asset.status)
+            .join(Asset, Candidate.asset_id == Asset.id)
+            .filter(Candidate.group_id.in_(group_ids))
+            .all()
         )
-        if stale_count > 0:
-            import logging
-            logging.getLogger(__name__).warning(
-                "A-17: 有 %d 個資產的 CLIP 向量使用舊模型（%s/%s → 目前設定 %s/%s），"
-                "評估時已排除這些資產。請執行「只重算 CLIP」後重新評估。",
-                stale_count,
-                "?", "?",
-                current_clip_model, current_clip_pretrained,
-            )
+        for gid, aid, is_keeper, status in rows:
+            if (gid, aid) in seen:
+                continue
+            seen.add((gid, aid))
+            out[gid].append((aid, bool(is_keeper), status))
+        return out
 
-        for clip_feat, asset in clip_features:
-            zs = {}
-            try:
-                raw_zs = clip_feat.zs
-                if isinstance(raw_zs, str):
-                    zs = json.loads(raw_zs)
-                elif isinstance(raw_zs, dict):
-                    zs = raw_zs
-            except Exception:
-                pass
+    def _groups_of_assets(self, session: Session, asset_ids: Iterable[int]) -> Set[int]:
+        asset_ids = list(set(asset_ids))
+        if not asset_ids:
+            return set()
+        return {g for (g,) in session.query(Candidate.group_id)
+                .filter(Candidate.asset_id.in_(asset_ids), Candidate.group_id.isnot(None)).distinct()}
 
-            normal_score = float(zs.get("normal_photo", 0.0))
-
-            # 1. 螢幕截圖檢查
-            for key in ["screenshot", "螢幕截圖", "截圖"]:
-                if key in zs and screenshot_enabled:
-                    score = float(zs[key])
-                    if score >= screenshot_th and score > normal_score:
-                        session.add(Candidate(
-                            asset_id=asset.id,
-                            rule=CandidateRule.SCREENSHOT.value,
-                            reason=f"AI 識別為螢幕截圖（信心度 {int(score * 100)}% ≥ 門檻 {int(screenshot_th * 100)}%）",
-                            score=score,
-                            group_id=None,
-                            is_keeper=False,
-                            state=CandidateState.CANDIDATE.value
-                        ))
-                        break
-
-            # 2. 文件 / 收據 / 白板筆記檢查
-            for key in ["document", "文件", "收據", "發票"]:
-                if key in zs and document_enabled:
-                    score = float(zs[key])
-                    if score >= document_th and score > normal_score:
-                        session.add(Candidate(
-                            asset_id=asset.id,
-                            rule=CandidateRule.DOCUMENT.value,
-                            reason=f"AI 識別為文件/收據/筆記（信心度 {int(score * 100)}% ≥ 門檻 {int(document_th * 100)}%）",
-                            score=score,
-                            group_id=None,
-                            is_keeper=False,
-                            state=CandidateState.CANDIDATE.value
-                        ))
-                        break
-
-            # 3. 梗圖 / 表情包 / 迷因檢查
-            for key in ["meme", "梗圖", "迷因", "表情包"]:
-                if key in zs and meme_enabled:
-                    score = float(zs[key])
-                    if score >= meme_th and score > normal_score:
-                        session.add(Candidate(
-                            asset_id=asset.id,
-                            rule=CandidateRule.MEME.value,
-                            reason=f"AI 識別為網路梗圖/表情包（信心度 {int(score * 100)}% ≥ 門檻 {int(meme_th * 100)}%）",
-                            score=score,
-                            group_id=None,
-                            is_keeper=False,
-                            state=CandidateState.CANDIDATE.value
-                        ))
-                        break
-
-            # 4. 誤拍 / 口袋 / 地板檢查
-            for key in ["mistouch", "誤拍", "廢片"]:
-                if key in zs and mistouch_enabled:
-                    score = float(zs[key])
-                    if score >= mistouch_th and score > normal_score:
-                        session.add(Candidate(
-                            asset_id=asset.id,
-                            rule=CandidateRule.MISTOUCH.value,
-                            reason=f"AI 識別為誤拍/口袋黑畫面（信心度 {int(score * 100)}% ≥ 門檻 {int(mistouch_th * 100)}%）",
-                            score=score,
-                            group_id=None,
-                            is_keeper=False,
-                            state=CandidateState.CANDIDATE.value
-                        ))
-                        break
+    def filter_queue_requests(self, session: Session, asset_ids: Iterable[int]) -> Tuple[Set[int], Set[int]]:
+        """
+        【鐵則 3】使用者要把 asset_ids 加入待刪時呼叫。
+        以「資產」為單位檢查它所屬的每一個群組：若加入後群組內沒有任何一張仍保留（未待刪、未刪除、
+        未遺失），就把其中一張（優先 Keeper）擋下。回傳 (允許, 被保護) 的資產 ID 集合。
+        """
+        requested = set(asset_ids)
+        groups = self._group_members(session, self._groups_of_assets(session, requested))
+        blocked: Set[int] = set()
+        changed = True
+        while changed:
+            changed = False
+            for gid, members in groups.items():
+                alive = [m for m in members if m[2] not in INACTIVE_ASSET_STATUSES]
+                if not alive:
+                    continue
+                survivors = [m for m in alive
+                             if (m[0] not in requested or m[0] in blocked) and m[2] != "queued"]
+                if survivors:
+                    continue
+                pickable = [m for m in alive if m[0] in requested and m[0] not in blocked]
+                if not pickable:
+                    continue
+                keeper = next((m for m in pickable if m[1]), None)
+                pick = keeper or min(pickable, key=lambda m: m[0])
+                blocked.add(pick[0])
+                changed = True
+        return requested - blocked, blocked
 
     def ensure_keeper_protection(self, session: Session, candidate_ids_to_queue: List[int]) -> List[int]:
+        """【向下相容】輸入候選 ID，回傳允許加入待刪的候選 ID。"""
+        rows = session.query(Candidate.id, Candidate.asset_id).filter(Candidate.id.in_(candidate_ids_to_queue)).all()
+        allowed, _ = self.filter_queue_requests(session, [aid for _, aid in rows])
+        return [cid for cid, aid in rows if aid in allowed]
+
+    def protect_deletion_batch(self, session: Session, asset_ids: Iterable[int]) -> Set[int]:
         """
-        【鐵則 3：保留最後一張保護 - 嚴格防禦】
-        任何重複群組（exact_dup, near_dup）至少必須保留 1 張相片。
-        若本次操作或先前操作會導致整個群組全部進入待刪，Keeper 絕對禁止加入待刪。
+        刪除前最後一道防線：若這批刪除會讓某個群組一張都不剩（只計算仍存在於磁碟上的成員），
+        從這批中移除一張（優先 Keeper）。回傳被擋下的資產 ID。
         """
-        candidates = session.query(Candidate).filter(Candidate.id.in_(candidate_ids_to_queue)).all()
-        candidate_id_set = set(candidate_ids_to_queue)
-        asset_id_set = {c.asset_id for c in candidates}
-        safe_candidate_ids = []
-
-        for c in candidates:
-            if c.is_keeper and c.group_id:
-                # 查詢同組的所有其他成員
-                other_members = session.query(Candidate).filter(
-                    Candidate.group_id == c.group_id,
-                    Candidate.asset_id != c.asset_id
-                ).all()
-
-                # 檢查同組其他成員是否已經在 queued 狀態，或本次同時要被加入 queued
-                all_others_will_be_queued = all(
-                    (m.state == CandidateState.QUEUED.value)
-                    or (m.id in candidate_id_set)
-                    or (m.asset_id in asset_id_set)
-                    for m in other_members
-                )
-
-                # 若全部其他成員都被待刪，此 Keeper 為唯一的保留相片，嚴格禁止加入待刪
-                if all_others_will_be_queued and len(other_members) > 0:
+        batch = set(asset_ids)
+        groups = self._group_members(session, self._groups_of_assets(session, batch))
+        blocked: Set[int] = set()
+        changed = True
+        while changed:
+            changed = False
+            for gid, members in groups.items():
+                alive = [m for m in members if m[2] not in INACTIVE_ASSET_STATUSES]
+                if not alive:
                     continue
+                if any(m[0] not in batch or m[0] in blocked for m in alive):
+                    continue
+                pickable = [m for m in alive if m[0] not in blocked]
+                keeper = next((m for m in pickable if m[1]), None)
+                pick = keeper or min(pickable, key=lambda m: m[0])
+                blocked.add(pick[0])
+                changed = True
+        return blocked
 
-            safe_candidate_ids.append(c.id)
+    def _reconcile_keepers(self, session: Session) -> int:
+        """評估後：若某群組所有現存成員都在待刪，把 Keeper 退回候選。"""
+        gids = [g for (g,) in session.query(Group.id).all()]
+        groups = self._group_members(session, gids)
+        restored = 0
+        for gid, members in groups.items():
+            alive = [m for m in members if m[2] not in INACTIVE_ASSET_STATUSES]
+            if not alive:
+                continue
+            states = {aid: st for aid, st in session.query(Candidate.asset_id, Candidate.state)
+                      .filter(Candidate.group_id == gid)}
+            if all(states.get(m[0]) == CandidateState.QUEUED.value for m in alive):
+                keeper = next((m for m in alive if m[1]), alive[0])
+                session.query(Candidate).filter(Candidate.asset_id == keeper[0]).update(
+                    {"state": CandidateState.CANDIDATE.value}, synchronize_session=False)
+                session.query(Asset).filter(Asset.id == keeper[0]).update(
+                    {"status": "candidate"}, synchronize_session=False)
+                restored += 1
+        return restored
 
-        return safe_candidate_ids
 
 rules_engine = RulesEngine()

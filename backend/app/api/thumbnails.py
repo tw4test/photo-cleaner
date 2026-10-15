@@ -1,15 +1,12 @@
-import io
-from fastapi import APIRouter, HTTPException, Depends, Query, Response
-from fastapi.responses import FileResponse
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 from typing import Optional
-from pathlib import Path
 
-from app.core.database import get_db, SyncSessionLocal
-from app.models.schema import Asset, File
-from app.services.thumbnail import thumbnail_service
+from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import selectinload
+
+from app.core.database import SyncSessionLocal
+from app.models.schema import Asset
+from app.services.thumbnail import thumbnail_service, thumb_key_args
 
 router = APIRouter(prefix="/api/thumbnails", tags=["thumbnails"])
 
@@ -24,113 +21,39 @@ FALLBACK_ERROR_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320
 
 
 @router.get("/{asset_id}")
-async def get_asset_thumbnail(
-    asset_id: int,
-    v: Optional[str] = Query(None, description="版本號或檔案時間戳記以支援 Immutable 快取"),
-    db: AsyncSession = Depends(get_db)
-):
+def get_asset_thumbnail(asset_id: int, v: Optional[str] = Query(None)):
     """
-    獲取指定資產之縮圖：
-    1. 支援 URL 版本戳記 (v=mtime) 進行 HTTP 31536000s Immutable 永久快取。
-    2. RAW+JPG 配對時優先提取伴生 JPG，影片即時擷取第 1 幀。
-    3. 若讀取失敗，回傳動態 SVG 佔位圖且設置 no-cache，不汙染磁碟快取並保留重試機會。
+    取得資產縮圖（def：縮圖產生在 threadpool 執行，不阻塞 event loop / SSE）。
+    帶 v=mtime 時回傳 immutable 長快取；失敗回傳 SVG 佔位圖且不快取。
     """
-    stmt = (
-        select(Asset)
-        .options(selectinload(Asset.files))
-        .where(Asset.id == asset_id)
-    )
-    result = await db.execute(stmt)
-    asset = result.scalar_one_or_none()
-
-    if not asset:
-        raise HTTPException(status_code=404, detail="找不到指定的資產")
-
-    primary_file = None
-    if asset.files:
-        for f in asset.files:
-            if f.role == "primary":
-                primary_file = f
-                break
-        if not primary_file and asset.files:
-            primary_file = asset.files[0]
-
-    mtime = primary_file.mtime if primary_file else None
-    size = primary_file.size if primary_file else None
-
-    # 取得伴生圖路徑 (如 RAW + JPG 中的 JPG 檔案)
-    companion_path = None
-    if asset.paired_paths and isinstance(asset.paired_paths, list) and len(asset.paired_paths) > 0:
-        companion_path = asset.paired_paths[0]
-
-    thumb_path = thumbnail_service.generate_thumbnail(
-        file_path=asset.primary_path,
-        companion_path=companion_path,
-        mtime=mtime,
-        size=size
-    )
-
+    with SyncSessionLocal() as session:
+        asset = (session.query(Asset).options(selectinload(Asset.files))
+                 .filter(Asset.id == asset_id).first())
+        if not asset:
+            raise HTTPException(status_code=404, detail="找不到指定的資產")
+        args = thumb_key_args(asset)
+    thumb_path = thumbnail_service.generate_thumbnail(**args)
     if not thumb_path or not thumb_path.exists():
-        # 降級動態回傳 SVG 佔位圖，不快取
-        return Response(
-            content=FALLBACK_ERROR_SVG,
-            media_type="image/svg+xml",
-            headers={
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0"
-            }
-        )
-
-    # 成功生成或命中快取：若有版本參數，發送 HTTP Immutable 強快取
-    headers = {}
-    if v:
-        headers["Cache-Control"] = "public, max-age=31536000, immutable"
-    else:
-        headers["Cache-Control"] = "public, max-age=86400"
-
-    return FileResponse(
-        str(thumb_path),
-        media_type="image/jpeg",
-        headers=headers
-    )
+        return Response(content=FALLBACK_ERROR_SVG, media_type="image/svg+xml",
+                        headers={"Cache-Control": "no-cache, no-store, must-revalidate",
+                                 "Pragma": "no-cache", "Expires": "0"})
+    cache = "public, max-age=31536000, immutable" if v else "public, max-age=86400"
+    return FileResponse(str(thumb_path), media_type="image/jpeg", headers={"Cache-Control": cache})
 
 
 @router.post("/cleanup")
-async def cleanup_orphan_thumbnails(db: AsyncSession = Depends(get_db)):
-    """
-    掃描磁碟縮圖快取目錄，清理所有已不存在於資料庫中的孤兒縮圖檔案，回收空間並確保完全一致。
-    """
-    # 查詢所有非 deleted 狀態的有效資產
-    stmt = select(Asset).options(selectinload(Asset.files)).where(Asset.status != "deleted")
-    result = await db.execute(stmt)
-    active_assets = result.scalars().all()
-
-    valid_keys = set()
-    for asset in active_assets:
-        primary_file = None
-        for f in asset.files:
-            if f.role == "primary":
-                primary_file = f
-                break
-        mtime = primary_file.mtime if primary_file else None
-        size = primary_file.size if primary_file else None
-        companion_path = asset.paired_paths[0] if (asset.paired_paths and len(asset.paired_paths) > 0) else None
-
-        cache_key = thumbnail_service.get_cache_key(
-            file_path=asset.primary_path,
-            mtime=mtime,
-            size=size,
-            companion_path=companion_path
-        )
-        valid_keys.add(cache_key)
-
-    cleanup_stats = thumbnail_service.cleanup_orphan_thumbnails(valid_keys)
-
+def cleanup_orphan_thumbnails():
+    """清理資料庫中已不存在的資產的縮圖。"""
+    with SyncSessionLocal() as session:
+        assets = (session.query(Asset).options(selectinload(Asset.files))
+                  .filter(Asset.status != "deleted").all())
+        valid_keys = {thumbnail_service.get_cache_key(**thumb_key_args(a)) for a in assets}
+        n = len(assets)
+    stats = thumbnail_service.cleanup_orphan_thumbnails(valid_keys)
     return {
         "status": "ok",
-        "active_assets_count": len(active_assets),
-        "deleted_orphan_thumbnails": cleanup_stats["deleted_count"],
-        "reclaimed_bytes": cleanup_stats["reclaimed_bytes"],
-        "reclaimed_mb": round(cleanup_stats["reclaimed_bytes"] / (1024 * 1024), 2)
+        "active_assets_count": n,
+        "deleted_orphan_thumbnails": stats["deleted_count"],
+        "reclaimed_bytes": stats["reclaimed_bytes"],
+        "reclaimed_mb": round(stats["reclaimed_bytes"] / (1024 * 1024), 2),
     }

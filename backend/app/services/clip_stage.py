@@ -1,347 +1,187 @@
 """
-clip_stage.py
-=============
-CLIP 分析階段服務。
+clip_stage.py（v0.5 GPU 批次管線）
+=================================
 
-負責對所有照片與 RAW 資產執行 CLIP 特徵提取與零樣本分類，
-並將結果 upsert 至 `clip_features` 資料表。
+    DB 查詢待處理資產（主執行緒）
+      └─► N 條 loader 執行緒：讀 320px 縮圖（無則讀原檔）→ 補邊成正方形 → 正規化
+            └─► 依序收集成批（batch_size 張）
+                  └─► 單一推理迴圈：fp16 forward（CUDA）→ 零樣本分類
+                        └─► writer 執行緒：每批一次 bulk upsert + commit
 
-支援以下情境：
-- 首次分析（無 `clip_features` 記錄）
-- 模型設定變更後的過期記錄重新分析
-- 重試先前失敗的資產（`retry_failed=True`）
-
-Multi-threading
----------------
-候選資產篩選在主線程完成。實際 CLIP 推理分發至 `runners` 個 worker
-執行緒（ThreadPoolExecutor），每個 worker 使用獨立的 SyncSessionLocal
-session。進度以 threading.Lock 保護的計數器推進。
-
-⚠️ GPU 注意事項：當 device='cuda' 時，建議 runners=1，
-   多 thread 搶占同一 CUDA context 可能導致效能下降或錯誤。
+- runners（clip_runners）= loader 執行緒數；GPU 推理永遠只有一條流水線。
+- batch_size：設定 clip_batch_size，0 = 依顯存自動（≥12GB:128、≥6GB:64、其餘 32；CPU:16）。
+- 顯存不足（OOM）時自動把批次減半重試同一批，不會產生任何假資料。
+- 單張讀圖/推理失敗 → analysis_failures（stage='clip'），可用「重試失敗」再跑。
+- 模型或權重與目前設定不同的記錄視為過期，會被重算。
 """
-
-import json
 import logging
-import math
+import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
-from app.models.schema import Asset, ClipFeature, AnalysisFailure, File
-from app.stubs.clip_stub import clip_extractor
+from app.core.defaults import get_setting
+from app.models.schema import AnalysisFailure, Asset, ClipFeature
+from app.services.thumbnail import thumb_key_args, thumbnail_service
+from app.stubs.clip_stub import clip_extractor, is_oom_error
 
 logger = logging.getLogger(__name__)
 
-# 零樣本分類標籤
-_ZS_LABELS = ["螢幕截圖", "文件", "誤拍", "梗圖"]
+WRITE_QUEUE_MAX = 8
 
 
-def _get_clip_settings(session) -> tuple[str, str]:
-    """
-    取得目前生效的 CLIP 模型設定。
-
-    優先讀取資料庫中的使用者設定；若無設定記錄則回退至 DEFAULT_SETTINGS。
-
-    Returns:
-        (model, pretrained) 字串元組。
-    """
-    from app.api.settings import DEFAULT_SETTINGS
-
-    model = DEFAULT_SETTINGS["clip_model"]
-    pretrained = DEFAULT_SETTINGS["clip_pretrained"]
-
-    try:
-        from app.models.schema import Setting
-
-        s_model = session.query(Setting).get("clip_model")
-        s_pre = session.query(Setting).get("clip_pretrained")
-        if s_model:
-            model = json.loads(s_model.value)
-        if s_pre:
-            pretrained = json.loads(s_pre.value)
-    except Exception:
-        pass  # DB 不可用時靜默降級至預設值
-
-    return model, pretrained
+def _get_clip_settings(session) -> Tuple[str, str]:
+    return get_setting(session, "clip_model"), get_setting(session, "clip_pretrained")
 
 
-def _resolve_device(device: str) -> str:
-    """
-    解析並驗證目標運算裝置。
-
-    - 'cuda'：強制使用 GPU；若不可用則拋出 RuntimeError。
-    - 'auto'：自動選擇，有 GPU 優先用 GPU，否則靜默回退至 CPU。
-    - 'cpu'：直接使用 CPU。
-
-    Returns:
-        實際使用的裝置字串：'cuda' 或 'cpu'。
-
-    Raises:
-        RuntimeError: 當 `device='cuda'` 但 CUDA 不可用時。
-    """
-    cuda_available = getattr(clip_extractor, "cuda_available", False)
-
-    if device == "cuda":
-        if not cuda_available:
-            from app.services.cuda_manager import cuda_manager
-            hw = cuda_manager.get_cuda_status()
-            if hw.get("has_nvidia_gpu"):
-                raise RuntimeError(
-                    f"偵測到您的電腦配備 {hw.get('gpu_name')}，但目前環境為 CPU 版 PyTorch。"
-                    "請在介面點擊「一鍵啟用 GPU 加速」下載安裝 CUDA 套件，或改選「自動」/「CPU」模式。"
-                )
-            raise RuntimeError("本機未檢測到相容的 NVIDIA GPU，無法強制使用 CUDA 模式。請選擇 CPU 或自動模式。")
-        logger.info("[clip_stage] 使用裝置：CUDA（GPU）")
-        return "cuda"
-
-    if device == "auto":
-        if cuda_available:
-            logger.info("[clip_stage] 自動選擇裝置：CUDA（GPU）")
-            return "cuda"
-        else:
-            logger.info("[clip_stage] 自動選擇裝置：CPU（GPU 不可用）")
-            return "cpu"
-
-    # device == 'cpu' 或其他未知值，統一使用 CPU
-    logger.info("[clip_stage] 使用裝置：CPU")
-    return "cpu"
-
-
-def _get_failed_asset_ids(session, stage: str) -> set[int]:
-    """回傳指定階段有失敗記錄的資產 ID 集合。"""
-    rows = (
-        session.query(AnalysisFailure.asset_id)
-        .filter(AnalysisFailure.stage == stage)
-        .all()
-    )
-    return {r.asset_id for r in rows}
-
-
-def _upsert_analysis_failure(
-    session, asset_id: int, stage: str, error_msg: str
-) -> None:
-    """
-    Upsert 分析失敗記錄。
-
-    若同一資產同一階段已有失敗記錄，更新錯誤訊息與時間；
-    否則新增一筆記錄。
-    """
-    existing = (
-        session.query(AnalysisFailure)
-        .filter_by(asset_id=asset_id, stage=stage)
-        .first()
-    )
-    if existing:
-        existing.error_msg = error_msg
-        existing.occurred_at = datetime.utcnow()
-    else:
-        session.add(
-            AnalysisFailure(
-                asset_id=asset_id,
-                stage=stage,
-                error_msg=error_msg,
-                occurred_at=datetime.utcnow(),
-            )
-        )
-
-
-def _clear_analysis_failure(session, asset_id: int, stage: str) -> None:
-    """清除指定資產指定階段的失敗記錄（分析成功後呼叫）。"""
-    session.query(AnalysisFailure).filter_by(asset_id=asset_id, stage=stage).delete()
-
-
-def _split_chunks(items: list, n: int) -> list[list]:
-    """將 items 均分為最多 n 個非空 chunk。"""
-    if not items:
-        return []
-    n = min(n, len(items))
-    size = math.ceil(len(items) / n)
-    return [items[i : i + size] for i in range(0, len(items), size)]
+def _failed_asset_ids(session) -> set:
+    return {r.asset_id for r in session.query(AnalysisFailure.asset_id).filter(AnalysisFailure.stage == "clip")}
 
 
 # ─────────────────────────────────────────────
-# Worker
+# Writer
 # ─────────────────────────────────────────────
+class _Writer(threading.Thread):
+    """單一寫入執行緒：接收 (成功列表, 失敗列表)，每批一次交易。"""
 
-def _clip_worker(
-    asset_ids: list[int],
-    current_model: str,
-    current_pretrained: str,
-    device_used: str,
-    failed_ids: set[int],
-    cancel_event: threading.Event,
-    progress_lock: threading.Lock,
-    progress_counter: list,
-    total_assets: int,
-    progress_tracker,
-) -> dict:
-    """
-    Worker 函式：在獨立 session 中對指定資產列表執行 CLIP 特徵提取。
+    def __init__(self, model: str, pretrained: str):
+        super().__init__(name="clip-writer", daemon=True)
+        self.q: "queue.Queue[Optional[Tuple[list, list]]]" = queue.Queue(maxsize=WRITE_QUEUE_MAX)
+        self.model = model
+        self.pretrained = pretrained
+        self.error: Optional[BaseException] = None
+        self.written = 0
+        self.failed_written = 0
 
-    Returns
-    -------
-    dict with keys: processed, done, stale_found, failed
-    """
-    from app.core.database import SyncSessionLocal
-
-    processed = 0
-    done = 0
-    stale_found = 0
-    failed = 0
-
-    with SyncSessionLocal() as session:
-        for asset_id in asset_ids:
-            if cancel_event.is_set():
-                break
-
-            asset: Optional[Asset] = session.get(Asset, asset_id)
-            if asset is None:
-                with progress_lock:
-                    progress_counter[0] += 1
-                continue
-
-            primary_path = asset.primary_path
-
-            # 確認實體檔案存在
-            if not Path(primary_path).exists():
-                logger.debug(
-                    "[clip_stage] 跳過 asset_id=%d，檔案不存在：%s",
-                    asset.id, primary_path,
-                )
-                with progress_lock:
-                    progress_counter[0] += 1
-                    current = progress_counter[0]
-                if progress_tracker:
-                    try:
-                        progress_tracker.update_analyze_progress(current, total_assets, primary_path)
-                    except InterruptedError:
-                        cancel_event.set()
-                continue
-
-            # 判斷是否需要處理
-            clip_rec: Optional[ClipFeature] = asset.clip_feature
-            is_missing = clip_rec is None
-            is_stale = (
-                not is_missing
-                and (
-                    clip_rec.model != current_model
-                    or clip_rec.pretrained != current_pretrained
-                )
-            )
-            is_failed_retry = asset.id in failed_ids
-
-            if not is_missing and not is_stale and not is_failed_retry:
-                done += 1
-                with progress_lock:
-                    progress_counter[0] += 1
-                    current = progress_counter[0]
-                if progress_tracker:
-                    try:
-                        progress_tracker.update_analyze_progress(current, total_assets, primary_path)
-                    except InterruptedError:
-                        cancel_event.set()
-                continue
-
-            if is_stale:
-                stale_found += 1
-                logger.debug(
-                    "[clip_stage] asset_id=%d 的 CLIP 記錄已過期（model 或 pretrained 不符），重新分析",
-                    asset.id,
-                )
-
-            # 執行 CLIP 特徵提取（單次解碼 + 單次 forward 取得 embedding 與 zero-shot）
-            try:
-                # 取得本地縮圖快取路徑（若 basic_stage 已生成，直接從本地 NVMe 讀取 320x320，跳過 NAS 網路傳輸）
-                from app.services.thumbnail import thumbnail_service
-                primary_file = None
-                if asset.files:
-                    for f in asset.files:
-                        if f.role == "primary":
-                            primary_file = f
-                            break
-                mtime_v = primary_file.mtime if primary_file else None
-                size_v = primary_file.size if primary_file else None
-                companion_v = (
-                    asset.paired_paths[0]
-                    if (asset.paired_paths and len(asset.paired_paths) > 0)
-                    else None
-                )
-                local_thumb_p = thumbnail_service.get_thumbnail_path(
-                    file_path=primary_path,
-                    mtime=mtime_v,
-                    size=size_v,
-                    companion_path=companion_v,
-                )
-                thumb_str = str(local_thumb_p) if local_thumb_p.exists() else None
-
-                embedding, zs_scores = clip_extractor.extract_all(
-                    primary_path,
-                    _ZS_LABELS,
-                    is_raw=(asset.media_type == "raw"),
-                    thumb_path=thumb_str,
-                    model_name=current_model,
-                    pretrained=current_pretrained,
-                    device=device_used,
-                )
-                dim = len(embedding) // 4  # float32 → 每個元素 4 bytes
-
-                # Upsert ClipFeature
-                if clip_rec is None:
-                    clip_rec = ClipFeature(asset_id=asset.id)
-                    session.add(clip_rec)
-
-                clip_rec.model = current_model
-                clip_rec.pretrained = current_pretrained
-                clip_rec.dim = dim
-                clip_rec.embedding = embedding
-                clip_rec.zs = zs_scores
-                clip_rec.analyzed_at = datetime.utcnow()
-
-                _clear_analysis_failure(session, asset.id, "clip")
-
-                session.flush()
-                session.commit()
-                processed += 1
-                logger.debug(
-                    "[clip_stage] asset_id=%d 分析完成，dim=%d，zs=%s",
-                    asset.id, dim, zs_scores,
-                )
-
-            except Exception as exc:
-                session.rollback()
-                error_msg = str(exc)
-                logger.warning(
-                    "[clip_stage] asset_id=%d 分析失敗：%s", asset.id, error_msg
-                )
+    def run(self):
+        from app.core.database import SyncSessionLocal
+        with SyncSessionLocal() as session:
+            while True:
+                item = self.q.get()
+                if item is None:
+                    break
+                ok_rows, fail_rows = item
                 try:
-                    _upsert_analysis_failure(session, asset.id, "clip", error_msg)
-                    session.flush()
+                    self._write(session, ok_rows, fail_rows)
                     session.commit()
-                except Exception:
+                    self.written += len(ok_rows)
+                    self.failed_written += len(fail_rows)
+                except BaseException as exc:  # noqa: BLE001
                     session.rollback()
-                failed += 1
+                    logger.exception("[clip_stage] 寫入資料庫失敗")
+                    self.error = exc
 
-            finally:
-                with progress_lock:
-                    progress_counter[0] += 1
-                    current = progress_counter[0]
-                if progress_tracker:
+    def _write(self, session, ok_rows: list, fail_rows: list):
+        now = datetime.utcnow()
+        if ok_rows:
+            values = [
+                {
+                    "asset_id": aid,
+                    "model": self.model,
+                    "pretrained": self.pretrained,
+                    "dim": int(emb.shape[0]),
+                    "embedding": emb.astype(np.float32).tobytes(),
+                    "zs": zs,
+                    "analyzed_at": now,
+                }
+                for aid, emb, zs in ok_rows
+            ]
+            table = ClipFeature.__table__
+            for i in range(0, len(values), 500):
+                stmt = sqlite_insert(table).values(values[i:i + 500])
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[table.c.asset_id],
+                    set_={c: stmt.excluded[c] for c in ("model", "pretrained", "dim", "embedding", "zs", "analyzed_at")},
+                )
+                session.execute(stmt)
+            ok_ids = [r[0] for r in ok_rows]
+            session.query(AnalysisFailure).filter(
+                AnalysisFailure.stage == "clip", AnalysisFailure.asset_id.in_(ok_ids)
+            ).delete(synchronize_session=False)
+        if fail_rows:
+            fail_ids = [r[0] for r in fail_rows]
+            session.query(AnalysisFailure).filter(
+                AnalysisFailure.stage == "clip", AnalysisFailure.asset_id.in_(fail_ids)
+            ).delete(synchronize_session=False)
+            session.add_all([
+                AnalysisFailure(asset_id=aid, stage="clip", error_msg=msg[:2000], occurred_at=now)
+                for aid, msg in fail_rows
+            ])
+
+    def put(self, ok_rows: list, fail_rows: list):
+        if ok_rows or fail_rows:
+            self.q.put((ok_rows, fail_rows))
+
+    def close(self):
+        self.q.put(None)
+        self.join()
+
+
+# ─────────────────────────────────────────────
+# Loader
+# ─────────────────────────────────────────────
+def _load_one(item: Dict[str, Any], image_size: int, mean, std):
+    """在 loader 執行緒中執行：讀圖 + 前處理。回傳 (asset_id, path, array 或 例外)。"""
+    try:
+        img = clip_extractor.load_image(item["path"], is_raw=item["is_raw"], thumb_path=item["thumb"])
+        arr = clip_extractor.preprocess(img, image_size, mean, std)
+        return item["asset_id"], item["path"], arr
+    except Exception as exc:  # noqa: BLE001
+        return item["asset_id"], item["path"], exc
+
+
+# ─────────────────────────────────────────────
+# Encoder with OOM back-off
+# ─────────────────────────────────────────────
+class _BatchEncoder:
+    def __init__(self, backend, batch_size: int):
+        self.backend = backend
+        self.batch_size = max(1, batch_size)
+
+    def encode(self, ids: List[int], arrays: List[np.ndarray]):
+        """回傳 (成功列表[(id, emb, zs)], 失敗列表[(id, msg)])。"""
+        ok, fail = [], []
+        i = 0
+        while i < len(arrays):
+            n = self.batch_size
+            chunk_ids, chunk = ids[i:i + n], arrays[i:i + n]
+            try:
+                emb, zs = clip_extractor.encode_batch(self.backend, np.stack(chunk))
+                ok.extend(zip(chunk_ids, emb, zs))
+                i += len(chunk)
+            except Exception as exc:  # noqa: BLE001
+                if is_oom_error(exc) and self.batch_size > 1:
+                    if hasattr(self.backend, "empty_cache"):
+                        self.backend.empty_cache()
+                    self.batch_size = max(1, self.batch_size // 2)
+                    logger.warning("[clip_stage] 顯存不足，批次大小降為 %d 後重試", self.batch_size)
+                    continue
+                if len(chunk) == 1:
+                    fail.append((chunk_ids[0], f"{type(exc).__name__}: {exc}"))
+                    i += 1
+                    continue
+                # 非 OOM 錯誤：逐張重跑找出有問題的那張
+                for aid, arr in zip(chunk_ids, chunk):
                     try:
-                        progress_tracker.update_analyze_progress(current, total_assets, primary_path)
-                    except InterruptedError:
-                        cancel_event.set()
-
-    return {"processed": processed, "done": done, "stale_found": stale_found, "failed": failed}
+                        e1, z1 = clip_extractor.encode_batch(self.backend, arr[None])
+                        ok.append((aid, e1[0], z1[0]))
+                    except Exception as exc1:  # noqa: BLE001
+                        fail.append((aid, f"{type(exc1).__name__}: {exc1}"))
+                i += len(chunk)
+        return ok, fail
 
 
 # ─────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────
-
 def run_clip_stage(
     session,
     device: str = "auto",
@@ -349,154 +189,151 @@ def run_clip_stage(
     merge_with_basic: bool = False,
     progress_tracker=None,
     runners: Optional[int] = None,
+    batch_size: Optional[int] = None,
 ) -> dict:
     """
-    執行 CLIP 分析階段。
-
-    遍歷所有需要處理的照片／RAW 資產，提取 CLIP 嵌入向量與零樣本分類分數，
-    並將結果 upsert 至 `clip_features` 資料表。
-
-    需要分析的資產條件（符合其一即處理）：
-    1. 尚無 `clip_features` 記錄
-    2. 現有記錄的 model／pretrained 與當前設定不符（過期）
-    3. 若 `retry_failed=True`：之前在 'clip' 階段失敗的資產
-
-    跳過條件：
-    - `asset.status` 為 'deleted' 或 'missing'
-    - `asset.primary_path` 所指向的實體檔案不存在
-
-    Args:
-        session:          SQLAlchemy 同步 Session（用於候選資產查詢）。
-        device:           運算裝置，'auto' | 'cuda' | 'cpu'。
-        retry_failed:     若為 True，亦重新處理有失敗記錄的資產。
-        merge_with_basic: 若為 True，表示與 basic 階段同次執行（保留供未來優化用）。
-        progress_tracker: 可選的進度追蹤物件。
-        runners:          並行 worker 線程數。預設使用 settings.CLIP_RUNNERS。
-                          ⚠️ 使用 CUDA 時建議設為 1。
-
-    Returns:
-        dict with keys:
-            - processed   (int): 本次成功處理的資產數
-            - done        (int): 現有且未過期的資產數（跳過）
-            - stale_found (int): 偵測到過期記錄的資產數
-            - failed      (int): 本次分析失敗的資產數
-            - device_used (str): 實際使用的裝置
-
+    執行 CLIP 階段。回傳：
+      processed / done / stale_found / failed / skipped_failed / device_used / batch_size / images_per_sec
     Raises:
-        RuntimeError: 當 device='cuda' 但 CUDA 不可用時。
+      ClipDeviceError（RuntimeError）：指定 cuda 但不可用；模型載入失敗時拋出原始例外。
+      InterruptedError：使用者取消。
     """
     if runners is None:
         runners = settings.CLIP_RUNNERS
-    runners = max(1, runners)
+    runners = max(1, int(runners))
+    device_used = clip_extractor.resolve_device(device)
+    model, pretrained = _get_clip_settings(session)
 
-    # 1. 解析裝置
-    device_used = _resolve_device(device)
-
-    # GPU 模式下自動縮減為 1 runner，避免 CUDA context 衝突
-    if device_used == "cuda" and runners > 1:
-        logger.info(
-            "[clip_stage] 偵測到 CUDA 裝置，自動將 runners 從 %d 調整為 1（GPU 推理單線程最佳）",
-            runners,
-        )
-        runners = 1
-
-    # 2. 取得目前 CLIP 模型設定
-    current_model, current_pretrained = _get_clip_settings(session)
-    logger.info(
-        "[clip_stage] 模型設定：model=%s, pretrained=%s", current_model, current_pretrained
-    )
-
-    # 3. 取得有 CLIP 失敗記錄的資產 ID（若需重試）
-    failed_ids: set[int] = set()
-    if retry_failed:
-        failed_ids = _get_failed_asset_ids(session, "clip")
-        logger.info("[clip_stage] 找到 %d 筆先前 CLIP 失敗記錄，將重試", len(failed_ids))
-
-    # 4. 查詢所有非 video 類型、且未刪除/遺失的資產
-    photo_raw_assets: list[Asset] = (
+    # 1. 篩選待處理資產
+    failed_ids = _failed_asset_ids(session)
+    assets = (
         session.query(Asset)
-        .filter(
-            Asset.media_type.in_(["photo", "raw"]),
-            Asset.status.notin_(["deleted", "missing"]),
-        )
+        .options(selectinload(Asset.files), selectinload(Asset.clip_feature))
+        .filter(Asset.media_type.in_(["photo", "raw"]), Asset.status.notin_(["deleted", "missing"]))
         .all()
     )
-
-    total_assets = len(photo_raw_assets)
-    asset_ids = [a.id for a in photo_raw_assets]
-
+    todo: List[Dict[str, Any]] = []
+    done = stale = skipped_failed = 0
+    for a in assets:
+        rec = a.clip_feature
+        is_current = rec is not None and rec.model == model and rec.pretrained == pretrained
+        if is_current and a.id not in failed_ids:
+            done += 1
+            continue
+        if rec is None and a.id in failed_ids and not retry_failed:
+            skipped_failed += 1
+            continue
+        if rec is not None and not is_current:
+            stale += 1
+        thumb = thumbnail_service.get_thumbnail_path(**thumb_key_args(a))
+        todo.append({
+            "asset_id": a.id,
+            "path": a.primary_path,
+            "is_raw": a.media_type == "raw",
+            "thumb": str(thumb) if thumb.exists() else None,
+        })
+    total = len(todo)
+    result = {"processed": 0, "done": done, "stale_found": stale, "failed": 0,
+              "skipped_failed": skipped_failed, "device_used": device_used,
+              "batch_size": 0, "images_per_sec": 0.0}
     if progress_tracker:
-        progress_tracker.set_current_stage("clip", total=total_assets)
-
-    logger.info(
-        "[clip_stage] %d 個候選資產，使用 %d runner(s)，裝置：%s",
-        total_assets, runners, device_used,
-    )
-
-    if total_assets == 0:
-        result = {"processed": 0, "done": 0, "stale_found": 0, "failed": 0, "device_used": device_used}
-        logger.info("[clip_stage] 完成：%s", result)
+        progress_tracker.set_current_stage("clip", total=total, runners=runners)
+    logger.info("[clip_stage] model=%s/%s device=%s 待處理 %d（已完成 %d、過期 %d、略過失敗 %d）",
+                model, pretrained, device_used, total, done, stale, skipped_failed)
+    if total == 0:
         return result
-
-    # 5. 並行執行前 commit，確保 worker session 可見主 session 的最新資料
     session.commit()
 
-    cancel_event = threading.Event()
-    if progress_tracker and progress_tracker.is_cancel_requested():
-        cancel_event.set()
+    # 2. 載入模型（失敗 → 整個工作失敗，訊息會顯示在進度列）
+    if progress_tracker:
+        progress_tracker.set_stage_info(stage_label=f"正在載入 CLIP 模型 {model}（{device_used}）...")
+    backend = clip_extractor.get_backend(model, pretrained, device_used)
+    bs = int(batch_size or get_setting(session, "clip_batch_size") or 0)
+    if bs <= 0:
+        bs = clip_extractor.recommended_batch_size(device_used)
+    encoder = _BatchEncoder(backend, bs)
+    result["batch_size"] = bs
+    if progress_tracker:
+        progress_tracker.set_stage_info(
+            stage_label=f"正在執行 AI 語義向量提取與零樣本分類（{device_used.upper()}，批次 {bs}）...",
+            device_used=device_used, batch_size=bs,
+        )
 
-    progress_lock = threading.Lock()
-    progress_counter = [0]
+    writer = _Writer(model, pretrained)
+    writer.start()
+    processed = failed = 0
+    cancelled = False
+    t0 = time.time()
+    prefetch = max(bs * 3, runners * 4)
+    try:
+        with ThreadPoolExecutor(max_workers=runners, thread_name_prefix="clip-loader") as pool:
+            pending: deque = deque()
+            it = iter(todo)
 
-    chunks = _split_chunks(asset_ids, runners)
-    actual_runners = len(chunks)
-    logger.info(
-        "[clip_stage] dispatching %d asset(s) across %d thread(s)",
-        total_assets, actual_runners,
-    )
+            def _fill():
+                while len(pending) < prefetch:
+                    try:
+                        item = next(it)
+                    except StopIteration:
+                        return
+                    pending.append(pool.submit(_load_one, item, backend.image_size, backend.mean, backend.std))
 
-    # 統計計數器（aggregate）
-    total_processed = 0
-    total_done = 0
-    total_stale = 0
-    total_failed = 0
-
-    with ThreadPoolExecutor(max_workers=actual_runners) as executor:
-        futures = [
-            executor.submit(
-                _clip_worker,
-                chunk,
-                current_model,
-                current_pretrained,
-                device_used,
-                failed_ids,
-                cancel_event,
-                progress_lock,
-                progress_counter,
-                total_assets,
-                progress_tracker,
-            )
-            for chunk in chunks
-        ]
-        for future in as_completed(futures):
-            try:
-                r = future.result()
-                total_processed += r["processed"]
-                total_done += r["done"]
-                total_stale += r["stale_found"]
-                total_failed += r["failed"]
-            except Exception as exc:
-                logger.error("[clip_stage] worker raised unexpected error: %s", exc, exc_info=True)
-
-    # Worker 在獨立 session 中 commit，主 session 的 identity map 已過期。
+            _fill()
+            batch_ids: List[int] = []
+            batch_arrs: List[np.ndarray] = []
+            load_fail: List[Tuple[int, str]] = []
+            last_path = ""
+            while pending or batch_ids:
+                if progress_tracker and progress_tracker.is_cancel_requested():
+                    cancelled = True
+                    break
+                flush = not pending
+                if pending:
+                    aid, path, out = pending.popleft().result()
+                    last_path = path
+                    _fill()
+                    if isinstance(out, Exception):
+                        load_fail.append((aid, f"{type(out).__name__}: {out}"))
+                    else:
+                        batch_ids.append(aid)
+                        batch_arrs.append(out)
+                    flush = len(batch_ids) >= encoder.batch_size or not pending
+                if flush:
+                    ok_rows, fail_rows = encoder.encode(batch_ids, batch_arrs) if batch_ids else ([], [])
+                    fail_rows = load_fail + fail_rows
+                    writer.put(ok_rows, fail_rows)
+                    if writer.error:
+                        raise RuntimeError(f"寫入 CLIP 結果失敗：{writer.error}")
+                    processed += len(ok_rows)
+                    failed += len(fail_rows)
+                    batch_ids, batch_arrs, load_fail = [], [], []
+                    if progress_tracker:
+                        try:
+                            progress_tracker.update_analyze_progress(processed + failed, total, last_path)
+                        except InterruptedError:
+                            cancelled = True
+                            break
+            # 剩下的讀圖失敗（例如最後幾張都失敗）
+            if load_fail:
+                writer.put([], load_fail)
+                failed += len(load_fail)
+            if cancelled:
+                for f in pending:
+                    f.cancel()
+    finally:
+        writer.close()
     session.expire_all()
 
-    result = {
-        "processed": total_processed,
-        "done": total_done,
-        "stale_found": total_stale,
-        "failed": total_failed,
-        "device_used": device_used,
-    }
+    elapsed = max(time.time() - t0, 1e-6)
+    result.update({
+        "processed": processed,
+        "failed": failed,
+        "batch_size": encoder.batch_size,
+        "images_per_sec": round((processed + failed) / elapsed, 1),
+    })
+    if writer.error:
+        raise RuntimeError(f"寫入 CLIP 結果失敗：{writer.error}")
     logger.info("[clip_stage] 完成：%s", result)
+    if cancelled:
+        raise InterruptedError("使用者已取消分析任務")
     return result

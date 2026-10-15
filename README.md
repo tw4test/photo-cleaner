@@ -7,150 +7,143 @@
 <a id="zh-tw"></a>
 ## 🇹🇼 繁體中文
 
-本地運行的相片庫整理與瘦身工具。專為龐大相片庫（如 10 萬張以上、300GB+、NAS 儲存）設計，透過多階段管線、AI 深度語義特徵（CLIP）與規則引擎，精準找出相片庫中的完全重複、近似重複、連拍多餘、螢幕截圖、單據文件、表情包梗圖、模糊與曝光不良等廢片。前端提供流暢的虛擬滾動工作台供人工審核，並以嚴格的資源回收筒機制執行批量安全清理。
+本地運行的相片庫整理工具，針對大型相片庫（約 10 萬張、300GB，可放在 NAS）設計。
+以 SHA-256、pHash、清晰度 / 亮度與 **CLIP 零樣本分類**找出完全重複、近似重複、模糊、曝光不良、螢幕截圖、文件 / 收據、梗圖與誤拍相片；在虛擬化網格中人工審核後，批次移至 Windows 資源回收筒。
 
----
+完整規格請見 [`photo-cleaner-functional-spec-0.4.md`](photo-cleaner-functional-spec-0.4.md)。
 
-### 🛡️ 核心防護原則（鐵則）
+### 🛡️ 核心防護原則
+1. **只有 Process 頁能動實體檔案**：Review 頁的所有操作只改資料庫狀態。
+2. **預設移至資源回收筒**（`send2trash`）。
+3. **Keeper 保護**：重複群組加入待刪時，系統會保留建議的最佳一張（實作限制見規格書 G-4）。
+4. **配對檔案視為同一資產**：Live Photo（HEIC/JPG + MOV）與 RAW + JPG 一起處理。
+5. **完全本地**：後端只綁定 `127.0.0.1`，無遙測。
 
-1. **只有 Process 頁能動實體檔案**：Review 審核頁面的所有挑選、忽略、標記操作僅變更資料庫狀態，絕不觸碰實體硬碟檔案。
-2. **預設安全刪除**：使用作業系統資源回收筒（Windows `send2trash`），刪除後可隨時於桌面資源回收筒還原。
-3. **保留最後一張保護（Keeper Protection）**：任何重複或連拍分組中，系統強制防呆機制，禁止全選刪除，確保每個分組至少保留一份最佳檔案。
-4. **配對檔案一併處置**：Live Photo（HEIC/JPG + MOV）與 RAW + JPG 自動綁定為單一資產（Asset），刪除與保留操作絕對連動，不拆散檔案。
-5. **資料全程不離開本機**：服務僅監聽 `127.0.0.1`，完全無外部網路連線與雲端遙測。
-
----
-
-### 🔄 處理管線 (Processing Pipeline)
-
-系統採用多階段解耦管線設計，確保即使相片儲存於遠端 NAS，也能達到極致的分析效能與最低的網路負載：
+### 🔄 處理流程
+掃描、分析、評估三段各自獨立，可單獨執行，也可在 Library 頁依序執行。
 
 ```mermaid
 flowchart TD
-    Scan["1. Scan Roots (目錄遍歷與元數據收集)"] --> Pair["2. Pairing (Live Photo 與 RAW+JPG 資產配對)"]
-    Pair --> Basic["3. basic_stage (產生 320px 縮圖快取 + 計算基礎畫質與 pHash)"]
-    Basic --> Clip["4. clip_stage (讀取本地 320px 縮圖 + 計算 CLIP Embedding 與語義分類)"]
-    Clip --> Rules["5. Rules Engine (重複/連拍/品質/語義評估 + 套用 Keeper 保護)"]
-    Rules --> Review["6. Review 審核頁 (虛擬滾動人工審核，僅更新 DB 狀態)"]
-    Review --> Process["7. Process 執行頁 (最終確認批次清理，安全移至資源回收筒)"]
+    Scan["1. 掃描 Scan<br/>只同步目錄與 metadata，不讀圖<br/>模式：完整 / 只加入新檔案"] --> Analyze
+    subgraph Analyze["2. 分析 Analyze（四個獨立階段）"]
+        H["hash：SHA-256（只算大小重複者）"]
+        B["basic：320px 縮圖 + pHash / 模糊 / 亮度 / EXIF"]
+        C["clip：CLIP 向量 + 零樣本分類（GPU / CPU）"]
+        V["video：時長 / 解析度 / 編碼"]
+    end
+    Analyze --> Eval["3. 評估 Evaluate<br/>規則引擎產生候選 + Keeper"]
+    Eval --> Review["4. Review 審核（只改 DB）"]
+    Review --> Process["5. Process 執行刪除（回收筒）"]
 ```
 
-#### 💡 為什麼 clip 階段「網路傳輸 Network I/O = 0」？
-- 在 `basic_stage` 中，系統已預先自原始檔案（含龐大的 RAW / 4K 相片）解碼，並將高畫質 320px 縮圖快取儲存於本機高速儲存裝置（`thumbs_cache/`）。
-- CLIP 模型（如 ViT-B-16）的標準輸入維度僅為 224x224。因此在進入 `clip_stage` 時，推理引擎直接讀取本地已存在的 320px 縮圖，**完全不需要再次經由網路/SMB 讀取遠端 NAS 上的原始檔案**。
-- 這消除了 NAS 隨機讀取與網路頻寬瓶頸，使 CLIP 語義分析速度提升數倍，並確保網路監控流量在此階段維持為 0。
+#### 💡 NAS 上的 I/O
+- **basic** 階段會讀取原檔兩次：一次產生縮圖，一次計算特徵（RAW 使用內嵌預覽）。這一段會產生網路 I/O。
+- **clip** 階段優先讀取本地縮圖快取（`thumbs_cache/`）。basic 已完成時，clip 不需再讀取 NAS 原檔。
 
----
+### 🧠 AI（CLIP）
+- open_clip，預設 `ViT-B-16` / `openai`，512 維向量。
+- 以 prompt ensemble 對五個類別評分：`normal_photo`、`screenshot`、`document`、`meme`、`mistouch`。該類分數需高於門檻**且**高於 `normal_photo` 才列為候選。
+- 已實機驗證：**GTX 1650 Ti**、**RTX 5080**；無 GPU 時以 CPU 執行。
+- 分析時可選「自動 / 只用 GPU / 只用 CPU」。選「只用 GPU」但 CUDA 不可用時，工作直接失敗。
+- 更換模型後，舊向量標為「過期」，評估時不使用，重跑 clip 階段即可更新。
 
 ### 🛠️ 技術架構
+- **後端**：Python 3.10+、FastAPI、Uvicorn、SQLAlchemy 2.0、aiosqlite、SQLite（WAL）
+- **AI**：PyTorch、torchvision、open-clip-torch
+- **影像**：Pillow、pillow-heif、rawpy、OpenCV（headless）、imagehash
+- **前端**：React 18、TypeScript、Vite 5、Tailwind CSS、TanStack Virtual、React Router
 
-- **後端 (Backend)**：
-  - Python 3.10+、FastAPI、Uvicorn
-  - SQLAlchemy 2.0、aiosqlite、SQLite（WAL 模式併發）
-  - **AI / 深度學習**：PyTorch (`torch`, `torchvision`)、`open-clip-torch` (CLIP ViT-B-16 / 零樣本分類)、Cosine 相似度矩陣
-  - **影像處理**：Pillow、pillow-heif (HEIC 支援)、rawpy (RAW 相機原生解碼)、OpenCV (模糊與曝光檢測)、imagehash (pHash)
-  - **安全與系統**：`send2trash` (Windows 資源回收筒整合)、Server-Sent Events (SSE 即時進度廣播)
-- **前端 (Frontend)**：
-  - React 18、Vite、TypeScript
-  - Tailwind CSS、Lucide React
-  - TanStack Virtual (高效能大型相片縮圖虛擬滾動)
+### ⚙️ 設定
+**環境變數（`.env`，從啟動目錄讀取，一般為 `backend/.env`；定義於 `app/core/config.py`）**
 
----
+| 變數 | 預設值 | 說明 |
+|---|---|---|
+| `HOST` / `PORT` | `127.0.0.1` / `8000` | 僅供 `/api/health` 回報；實際綁定以 uvicorn 參數為準 |
+| `DEBUG` | `false` | SQLAlchemy echo |
+| `DATA_DIR` | `backend/data` | 資料目錄 |
+| `THUMBS_CACHE_DIR` | `backend/thumbs_cache` | 縮圖快取，建議放 SSD |
+| `DATABASE_URL` / `SYNC_DATABASE_URL` | `sqlite(+aiosqlite):///backend/data/app.db` | 要搬移資料庫時須同時修改這兩個；遷移前備份會依此路徑 |
+| `SQLITE_BUSY_TIMEOUT_MS` | `30000` | 多執行緒寫入時等待鎖的時間 |
+| `HASH_RUNNERS` / `BASIC_RUNNERS` / `CLIP_RUNNERS` / `VIDEO_RUNNERS` | CPU 核心數 // 2（1–16）| 各階段並行數；`CLIP_RUNNERS` 是讀圖執行緒數，GPU 推理固定一條流水線；Settings 頁的值會覆寫 |
+| `CLIP_BATCH_SIZE` | `0`（自動）| 0 = 依顯存：≥12GB 128、≥6GB 64、其餘 32；CPU 16。顯存不足時自動減半 |
 
-### ⚙️ 配置與效能調優
+**執行時設定（Settings 頁，存於 SQLite `settings` 表）**：
+- 規則開關與門檻
+- CLIP 模型（`clip_model` / `clip_pretrained`）
+- 預設運算裝置（`compute_device`）
+- 各階段 runner 數（1–16）
 
-所有進階選項皆可透過專案目錄下的 `.env` 檔案或後端設定調整：
+| 預設門檻 | 值 |
+|---|---|
+| 截圖 / 文件 / 梗圖 / 誤拍 | 0.60 / 0.55 / 0.65 / 0.55 |
+| 近似重複方式 | `either`（CLIP 或 pHash 任一符合）|
+| CLIP 近似門檻 / pHash 漢明距離 | 0.95 / 6 |
+| 近似群組上限 | 50（超過自動收緊門檻拆小）|
+| 連拍：時間視窗 / CLIP 相似度 | 2 秒 / 0.85 |
+| 模糊（Laplacian 變異數）| 100 |
+| 過暗 / 過曝（平均亮度）| 30 / 225 |
 
-```env
-# 服務監聽
-HOST=127.0.0.1
-PORT=8000
-
-# 存儲目錄
-DATA_DIR=backend/data
-THUMBS_CACHE_DIR=backend/thumbs_cache
-
-# 運算裝置與模型
-DEVICE=auto             # auto: 優先使用 CUDA，無則自動降級 CPU | cuda: 強制 GPU | cpu: 純 CPU
-CLIP_BATCH_SIZE=32      # CLIP 推理批次大小 (加大可提高 GPU 使用率)
-
-# 並行 Worker (Runners)
-BASIC_RUNNERS=8         # 基礎特徵與縮圖 Worker 數 (預設為 CPU 核心數 // 2)
-CLIP_RUNNERS=1          # CLIP Worker 數 (CUDA 模式下強制為 1)
-HASH_RUNNERS=4          # 雜湊計算 Worker 數
-VIDEO_RUNNERS=2         # 影片檢查 Worker 數
-```
-
-#### 🚀 效能調優關鍵指南：
-
-1. **縮圖快取放置於 NVMe SSD**：
-   - 強烈建議將 `THUMBS_CACHE_DIR` 設在本地高速 NVMe SSD 上。百萬次的高速 IOPS 讀取能徹底消除縮圖快取 I/O 延遲，並讓前端虛擬滾動流暢不卡頓。
-2. **SQLite 連線池限制 (QueuePool Limit)**：
-   - SQLAlchemy 預設的連線池為 `pool_size=5, max_overflow=10`（最大 15 個同時連線）。
-   - 若將 `BASIC_RUNNERS` 或其他階段的 runners 開大超過連線池上限，多執行緒同時請求 DB 連線時會觸發 `QueuePool limit exceeded` 報錯。若需增加大量 runners，請務必在 `database.py` 中相應加大 `pool_size` 與 `max_overflow`。
-3. **CUDA 模式下 runners 強制為 1**：
-   - 當 `DEVICE` 設為 `cuda` 時，系統會自動將 `CLIP_RUNNERS` 強制設為 `1`。因為多個執行緒同時競爭同一 GPU CUDA context 會造成顯存碎裂與嚴重鎖競爭，單一流水線是最穩定的作法。提速的正確方式是提高 `CLIP_BATCH_SIZE`。
-4. **「CPU 100% 但 GPU 僅 20%」是單張推理的正常現象**：
-   - CLIP 特徵提取包含兩個步驟：① CPU 端影像載入與預處理（Transform/Resize/Normalize）、② GPU 端神經網路 Forward Pass。
-   - 單張推理時，GPU 僅需數毫秒即可算完，大量時間消耗在 CPU 端的解碼與搬移。配合本地縮圖快取並調大 batch size，可顯著改善吞吐量。
-
----
+#### 🚀 效能建議
+- 把 `THUMBS_CACHE_DIR` 放在本機 SSD。
+- CLIP 為批次推理（loader 執行緒讀縮圖 → GPU 批次 fp16 → 背景批次寫入）。先跑 basic 產生縮圖，clip 階段就不需要再讀 NAS。
+- 測速：`python scripts/bench_clip.py <相片資料夾> --limit 2000`
+- 調高 runner 前，請確認 SQLAlchemy 連線池（`database.py`）足夠，且 SQLite 同時只允許一個寫入者。
 
 ### 🚀 快速啟動
-
-#### 1. 後端 (Backend)
-
-```bash
+#### 1. 後端
+```powershell
 cd backend
-
-# 建立並啟用虛擬環境 (Windows PowerShell)
 python -m venv venv
 .\venv\Scripts\Activate.ps1
-
-# 安裝依賴套件
 pip install -r requirements.txt
-
-# 啟動 FastAPI 服務 (監聽 127.0.0.1:8000)
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-> **提示**：系統具備 NVIDIA GPU 自動檢測。若環境具備相容的 NVIDIA 顯卡，可於系統設定中一鍵升級安裝 CUDA 版 PyTorch。
+#### GPU（選用）
+- 介面提供「一鍵啟用 GPU 加速」，可安裝 `cu121` / `cu118` 版 PyTorch。
+- **RTX 50 系列（如 RTX 5080）需要 CUDA 12.8 版 wheel**，請手動安裝：
+  ```powershell
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+  ```
 
-#### 2. 前端 (Frontend)
-
-```bash
+#### 2. 前端
+```powershell
 cd frontend
-
-# 安裝依賴套件
 npm install
-
-# 啟動開發伺服器 (http://127.0.0.1:5173，API 自動 Proxy 至 8000)
-npm run dev
+npm run dev   # http://127.0.0.1:5173，/api 代理至 8000
 ```
 
----
+#### 3. 測試
+```powershell
+cd backend
+pytest
+```
 
 ### 📂 專案結構
-
 ```
 photo-cleaner/
-├── backend/                  # FastAPI 後端
+├── backend/
 │   ├── app/
-│   │   ├── api/              # RESTful API 路由 (roots, scan, analyze, settings, thumbnails)
-│   │   ├── core/             # 資料庫 WAL 連線、配置 (.env) 與版本遷移
-│   │   ├── models/           # SQLAlchemy 關聯資料模型與列舉定義
-│   │   ├── services/         # 核心邏輯：scanner, pairing, basic_stage, clip_stage, rules_engine, deletion
-│   │   └── stubs/            # 影像分析與特徵抽取底層 (clip_stub, vector_stub)
-│   ├── data/                 # SQLite 資料庫 (app.db) 預設存放路徑
-│   ├── thumbs_cache/         # 320px 本地高速縮圖快取目錄
-│   └── requirements.txt      # 後端 Python 依賴清單
-├── frontend/                 # React + Vite 前端
-│   ├── src/
-│   │   ├── components/       # 側邊欄導航、進度條 (ScanProgressBar) 與通用 UI 元件
-│   │   └── pages/            # 核心頁面 (Dashboard, Library, Review, Process, Settings, History)
-│   └── package.json          # 前端依賴清單
-├── photo-cleaner-functional-spec-0.3.md # 完整功能規格書
-└── AGENT.md                  # 核心開發準則與防護鐵則
+│   │   ├── api/        # roots, jobs, scan(相容), analysis, candidates, process, history,
+│   │   │               # settings, thumbnails, dashboard, system
+│   │   ├── core/       # config, database (WAL), migration (user_version), progress (SSE)
+│   │   ├── models/     # schema.py, enums.py
+│   │   ├── services/   # scanner, pairing, scan_job, analyze_job, hash/basic/clip/video_stage,
+│   │   │               # feature_pipeline, thumbnail, rules_engine, deletion, stats_service, cuda_manager
+│   │   ├── stubs/      # 名稱沿用歷史命名，內容為真實實作：clip_stub (open_clip), raw_stub (rawpy),
+│   │   │               # video_probe_stub (OpenCV), vector_stub (餘弦相似度索引)
+│   │   └── main.py
+│   ├── tests/          # pytest
+│   └── requirements.txt
+├── frontend/src/
+│   ├── pages/          # Dashboard, Library, Review, Process, History, Settings
+│   ├── components/     # layout/AppShell, common/(ScanProgressBar, CudaInstallModal),
+│   │                   # scan/(ScanPanel, AnalysisPanel, EvaluatePanel)
+│   ├── hooks/          # useScanProgress (SSE + 輪詢)
+│   └── services/       # api.ts, types.ts
+├── photo-cleaner-functional-spec-0.4.md
+├── spec-update-scan-analysis.md   # 已併入 v0.4，保留作歷史紀錄
+└── AGENT.md
 ```
 
 ---
@@ -158,147 +151,81 @@ photo-cleaner/
 <a id="en"></a>
 ## 🇺🇸 English
 
-A locally hosted web application for photo library organization, deduplication, and cleanup. Tailored for handling massive personal photo libraries (100k+ photos, 300GB+, NAS storage). Powered by a multi-stage analysis pipeline, AI semantic embeddings (CLIP), and a multi-factor rules engine, Photo Cleaner reliably identifies exact duplicates, near duplicates, burst shots, screenshots, receipts/documents, memes, blurry photos, and bad exposures. It features a virtualized grid for manual review and safe batch deletion via the OS Recycle Bin.
+A local web app for cleaning up large photo libraries (about 100k photos / 300GB, local disk or NAS).
+It uses SHA-256, pHash, sharpness/brightness metrics and **CLIP zero-shot classification** to find exact duplicates, near duplicates, blurry or badly exposed shots, screenshots, documents/receipts, memes and accidental shots. You review them in a virtualized grid, then batch-move them to the Windows Recycle Bin.
 
----
+See [`photo-cleaner-functional-spec-0.4.md`](photo-cleaner-functional-spec-0.4.md) for the full specification (Traditional Chinese).
 
-### 🛡️ Core Safety Principles (Non-Negotiable Rules)
+### 🛡️ Core Safety Rules
+1. **Only the Process page touches files.** The Review page changes database state only.
+2. **Recycle Bin by default** (`send2trash`).
+3. **Keeper protection.** When a duplicate group is queued, the suggested best copy is kept (see spec gap G-4 for current limits).
+4. **Paired files are one asset.** Live Photo (HEIC/JPG + MOV) and RAW + JPG are always handled together.
+5. **Fully local.** The backend binds to `127.0.0.1` only, with no telemetry.
 
-1. **Physical Files Are Only Touched on the Process Page**: All actions on the Review page (selecting, ignoring, modifying status) strictly modify the local database state. Physical storage is never touched during review.
-2. **Default Safe Deletion**: Deletion targets the OS Recycle Bin via Windows `send2trash`. Files can be restored directly from the desktop Recycle Bin if needed.
-3. **Keeper Protection (Never Delete All)**：The rules engine strictly enforces keeper protection across duplicate and burst groups. It is impossible to select all photos in a group for deletion—at least one best asset is guaranteed to be retained.
-4. **Paired Files Managed Together**: Live Photos (HEIC/JPG + MOV) and RAW + JPG pairs are automatically treated as a single compound Asset. Retention and deletion operations affect all paired components together.
-5. **100% Local Processing**: Binds strictly to `127.0.0.1`. No telemetry, no external network requests, and zero cloud uploads.
+### 🔄 Workflow
+Scan, Analyze and Evaluate are independent jobs:
+1. **Scan** syncs files and metadata without reading image content. Modes: `full` or `new_only`.
+2. **Analyze** runs four independent stages:
+   - `hash`: SHA-256, only for files whose size is duplicated
+   - `basic`: 320px thumbnail, pHash, blur, brightness and EXIF
+   - `clip`: CLIP embedding and zero-shot scores, on GPU or CPU
+   - `video`: duration, resolution and codec
+3. **Evaluate** runs the rules engine to build candidates and pick keepers.
+4. **Review** your candidates.
+5. **Process** the queued ones to delete them.
 
----
+**NAS I/O.**
+- `basic` reads each original file twice: once for the thumbnail and once for features.
+- `clip` reads the local thumbnail cache first, so it does not re-read originals from the NAS once `basic` is done.
 
-### 🔄 Processing Pipeline
-
-Designed with a decoupled, staged architecture to maximize throughput and minimize network load over NAS/SMB connections:
-
-```mermaid
-flowchart TD
-    Scan["1. Scan Roots (Directory traversal & metadata collection)"] --> Pair["2. Pairing (Live Photo & RAW+JPG asset grouping)"]
-    Pair --> Basic["3. basic_stage (Generate 320px cache + calculate pHash/blur/exposure)"]
-    Basic --> Clip["4. clip_stage (Read 320px local cache + compute CLIP embeddings & zero-shot)"]
-    Clip --> Rules["5. Rules Engine (Evaluate duplicates/bursts/quality/semantics + enforce keeper protection)"]
-    Rules --> Review["6. Review Page (Virtualized review workstation; DB changes only)"]
-    Review --> Process["7. Process Page (Final confirmation batch deletion via send2trash)"]
-```
-
-#### 💡 Why Network I/O is ZERO during the CLIP Stage
-- In `basic_stage`, high-resolution original images and heavy RAW files are decoded once to produce 320px thumbnail caches on the local drive (`thumbs_cache/`).
-- Standard CLIP vision backbones (e.g., ViT-B-16) accept 224x224 input tensors. Therefore, during `clip_stage`, the inference engine reads directly from the local 320px thumbnail cache, **never re-fetching original photos over SMB from the NAS**.
-- This completely eliminates random seek latency over the network and brings network transmission to exactly zero during semantic extraction.
-
----
+### 🧠 AI (CLIP)
+- Uses open_clip, default `ViT-B-16` / `openai`, with 512-dim embeddings.
+- Prompt-ensemble zero-shot classification over five classes: `normal_photo`, `screenshot`, `document`, `meme` and `mistouch`. A photo becomes a candidate only if a class score passes its threshold **and** beats `normal_photo`.
+- Verified on **GTX 1650 Ti** and **RTX 5080**; falls back to CPU when no GPU is available.
+- You choose the device per run (auto / GPU only / CPU only). GPU-only fails fast if CUDA is unavailable.
+- After a model change, old vectors are marked stale, excluded from evaluation and recomputed by the next `clip` run.
 
 ### 🛠️ Tech Stack
+- **Backend:** FastAPI, SQLAlchemy 2.0, SQLite (WAL)
+- **AI:** PyTorch, open-clip-torch
+- **Imaging:** Pillow, pillow-heif, rawpy, OpenCV, imagehash
+- **Frontend:** React 18, TypeScript, Vite 5, Tailwind CSS, TanStack Virtual
 
-- **Backend**:
-  - Python 3.10+, FastAPI, Uvicorn
-  - SQLAlchemy 2.0, aiosqlite, SQLite (WAL mode)
-  - **AI / Deep Learning**: PyTorch (`torch`, `torchvision`), `open-clip-torch` (ViT-B-16 / Zero-shot classification), Cosine Similarity matrix calculation
-  - **Image Processing**: Pillow, pillow-heif (HEIC support), rawpy (native camera RAW decoding), OpenCV (blur & exposure analysis), imagehash (pHash)
-  - **System & Safety**: `send2trash` (Windows Recycle Bin integration), Server-Sent Events (SSE real-time progress broadcast)
-- **Frontend**:
-  - React 18, Vite, TypeScript
-  - Tailwind CSS, Lucide React
-  - TanStack Virtual (high-performance virtualized grid for massive image collections)
-
----
-
-### ⚙️ Configuration & Performance Tuning
-
-Configure runtime options via `.env` in the root or backend directory:
-
-```env
-# Server
-HOST=127.0.0.1
-PORT=8000
-
-# Storage Directories
-DATA_DIR=backend/data
-THUMBS_CACHE_DIR=backend/thumbs_cache
-
-# Compute Device & AI
-DEVICE=auto             # auto: Prefer CUDA if available, fallback to CPU | cuda: Force GPU | cpu: Force CPU
-CLIP_BATCH_SIZE=32      # Batch size for CLIP inference
-
-# Concurrency Runners
-BASIC_RUNNERS=8         # Workers for basic stage (default: CPU cores // 2)
-CLIP_RUNNERS=1          # Workers for CLIP stage (enforced to 1 under CUDA)
-HASH_RUNNERS=4          # Workers for hash stage
-VIDEO_RUNNERS=2         # Workers for video check stage
-```
-
-#### 🚀 Key Performance Insights:
-
-1. **Place Thumbnail Cache on NVMe SSD**:
-   - Set `THUMBS_CACHE_DIR` to a fast local NVMe SSD. High random-read IOPS eliminates I/O bottlenecks during both AI inference and frontend virtual scrolling.
-2. **SQLite QueuePool Limits**:
-   - SQLAlchemy engines default to `pool_size=5, max_overflow=10` (max 15 concurrent connections).
-   - If `BASIC_RUNNERS` or other worker counts are increased beyond the connection limit, workers will encounter `QueuePool limit of size 5 overflow 10 reached`. Increase `pool_size` and `max_overflow` in `database.py` accordingly when scaling up runners.
-3. **CLIP Runners Locked to 1 on CUDA**:
-   - When `DEVICE=cuda`, `CLIP_RUNNERS` is locked to `1` by design. Multiple worker threads competing for the same CUDA context induce driver overhead and memory fragmentation. Increasing `CLIP_BATCH_SIZE` is the proper way to maximize GPU throughput.
-4. **CPU 100% & GPU 20% Utilization is Normal**:
-   - Single-image inference pipelines spend significant time on CPU-bound image decompression, tensor transformations, and normalization, while the GPU forward pass takes only a few milliseconds. Batched processing and local NVMe caching help balance utilization.
-
----
+### ⚙️ Configuration
+- **Environment (`.env` in the working directory, normally `backend/.env`; defined in `app/core/config.py`):**
+  - `HOST` / `PORT` (`127.0.0.1` / `8000`): reported by `/api/health` only; the actual bind comes from the uvicorn arguments.
+  - `DEBUG` (`false`)
+  - `THUMBS_CACHE_DIR` (`backend/thumbs_cache`)
+  - `DATA_DIR` (`backend/data`). The database location comes from `DATABASE_URL` / `SYNC_DATABASE_URL` (default `backend/data/app.db`), so change both if you move it; the pre-migration backup follows that path.
+  - `HASH_RUNNERS` / `BASIC_RUNNERS` / `CLIP_RUNNERS` / `VIDEO_RUNNERS`: default CPU cores // 2 (1–16). `CLIP_RUNNERS` is the number of image-loader threads; GPU inference is always one pipeline. Settings-page values override them.
+  - `CLIP_BATCH_SIZE` (`0` = automatic by VRAM) and `SQLITE_BUSY_TIMEOUT_MS` (`30000`).
+  - All rule thresholds live in `app/core/defaults.py` and are changed on the Settings page.
+- **Runtime settings (Settings page, stored in SQLite):** rule toggles and thresholds, CLIP model, default device and per-stage runners (1–16).
+- **Default thresholds:**
+  - Screenshot / document / meme / mistouch: 0.60 / 0.55 / 0.65 / 0.55
+  - pHash distance: 6
+  - Blur: 100
+  - Under / over exposure: 30 / 225
+- **Performance:**
+  - Keep `THUMBS_CACHE_DIR` on a local SSD.
+  - The CLIP runner is forced to 1 on CUDA.
+  - CLIP runs in batches (loader threads → fp16 GPU batches → bulk DB writes); batch size is automatic and halves on out-of-memory.
+  - Benchmark: `python scripts/bench_clip.py <photo folder> --limit 2000`.
 
 ### 🚀 Getting Started
-
-#### 1. Backend
-
-```bash
-cd backend
-
-# Create & activate virtual environment (Windows PowerShell)
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-
-# Install dependencies
+```powershell
+# Backend
+cd backend; python -m venv venv; .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# Start FastAPI server (Listening on 127.0.0.1:8000)
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
+# RTX 50-series GPUs need the CUDA 12.8 wheel (the in-app installer offers cu121/cu118 only)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
-> **Note**: Includes automatic NVIDIA hardware detection. If a supported NVIDIA GPU is detected, you can enable PyTorch CUDA with one click in the Settings UI.
+# Frontend
+cd frontend; npm install; npm run dev   # http://127.0.0.1:5173
 
-#### 2. Frontend
-
-```bash
-cd frontend
-
-# Install Node dependencies
-npm install
-
-# Launch Vite dev server (http://127.0.0.1:5173, proxies /api to 8000)
-npm run dev
-```
-
----
-
-### 📂 Directory Structure
-
-```
-photo-cleaner/
-├── backend/                  # FastAPI Backend
-│   ├── app/
-│   │   ├── api/              # RESTful API routes (roots, scan, analyze, settings, thumbnails)
-│   │   ├── core/             # Database WAL engine, configuration (.env), and migrations
-│   │   ├── models/           # SQLAlchemy database schemas and enums
-│   │   ├── services/         # Business logic: scanner, pairing, basic_stage, clip_stage, rules_engine, deletion
-│   │   └── stubs/            # Low-level feature extractors (clip_stub, vector_stub)
-│   ├── data/                 # SQLite database (app.db) storage
-│   ├── thumbs_cache/         # 320px local high-speed thumbnail cache
-│   └── requirements.txt      # Python dependencies
-├── frontend/                 # React + Vite Frontend
-│   ├── src/
-│   │   ├── components/       # Navigation sidebar, ScanProgressBar, shared UI components
-│   │   └── pages/            # Core views (Dashboard, Library, Review, Process, Settings, History)
-│   └── package.json          # Node dependencies
-├── photo-cleaner-functional-spec-0.3.md # Comprehensive functional specification
-└── AGENT.md                  # Development guidelines and core principles
+# Tests
+cd backend; pytest
 ```
