@@ -1,0 +1,51 @@
+# 變更紀錄
+
+新的在上。每一版只記重點；需求的完整描述在 [`docs/functional-spec.md`](docs/functional-spec.md)，逐版的詳細說明（含舊的安裝步驟）封存在 [`docs/archive/`](docs/archive/)。
+
+## v0.6.5 — 2026-10-15
+
+- **大圖預覽**：雙擊卡片、縮圖放大鏡或空白鍵開啟；`←` `→` 沿清單切換；預覽中 `D` / `K` / `R` 只處理目前這一張並跳到下一張；點圖或 `F` 切換適合視窗 / 100%；資訊欄含偵測原因與重複群組的所有成員，可切換比較畫質。（PV-）
+- 新 API：`GET /api/candidates/preview/{asset_id}`（瀏覽器原生格式回傳原檔，其他格式與影片縮成最長邊 2560px 的 JPEG）、`GET /api/candidates/group/{group_id}`。
+- 應用程式更名為「**相片清理助手**」。
+- **文件整理**：README 精簡並拆出 `README.zh-TW.md`；新增 `docs/operations.md`；功能規格改為穩定檔名 `docs/functional-spec.md` 並移除預設值與完整 API 清單；各版 `CHANGELOG-v*.md` 合併為本檔，舊檔移到 `docs/archive/`；重寫 `AGENT.md`。
+
+## v0.6.4 — 2026-10-15
+
+- 主選單與審核篩選欄可各自收合成窄欄；`[` 一次收合 / 展開全部（專注模式）；狀態記在瀏覽器。（UI-01 至 UI-04）
+
+## v0.6.3 — 2026-10-15
+
+- **審核工作台重寫**（RV-）：後端分頁與統計（`GET /api/candidates/summary`、`/page`）、無限捲動；狀態變更直接更新畫面並可復原（`POST /api/candidates/undo`）；Shift 範圍選取；「選取符合條件的全部 N 張」→ 預覽 → 確認（`POST /api/candidates/bulk-status`，帶 `expected_count`）；分數門檻、排序、卡片大小；新增「連拍」「影片」分類。
+- **螢幕截圖 / 文件不受「群組至少保留一張」保護**（RV-31）：請求帶 `waive_protection_for` 才生效。
+- 行為變更：「全部候選」預設隱藏建議保留的相片，數量與側邊欄、首頁一致；`POST /api/candidates/batch-status` 的回應多了 `undo_token`、`updated_asset_ids`。
+
+## v0.6.2 — 2026-10-15
+
+- 修正設定頁無法捲動：頁面自己負責捲動。（UI-05）
+
+## v0.6.1 — 2026-10-15
+
+- **設定頁重新設計**（ST-）：分區、只送出有變更的項目、**只有變更了會影響評估的設定時才重新評估**（效能類設定不評估，分析進行中也能儲存）、顯示後端真正的錯誤訊息、未儲存變更提示、每個欄位可還原預設值。
+- 設定頁新增：近似重複比對方式、CLIP 近似門檻、連拍設定、CLIP 批次大小；移除刪除模式的介面（一律資源回收筒）。
+- 新 API：`GET /api/settings/meta`（預設值、範圍、選項、不影響評估的設定鍵）。`PUT /api/settings` 與 `POST /api/settings/reset` 的回應多了 `changed`、`evaluated`；值沒有變的 PUT 不再評估。
+
+## v0.6 — 2026-10-15
+
+- **評估狀態追蹤**：相片庫、分析結果、會影響評估的設定都沒變時自動略過評估；回報每次評估新增 / 移除幾張；提示「有 N 張相片在上次評估後完成分析」。（EV-09）
+- **一鍵流水線**：`POST /api/jobs/pipeline`，掃描 → 全部分析 → 評估，單一任務，掃描與分析期間可取消。
+- `GET /api/workflow/status`；首頁與資料庫頁重新設計：統計卡、「主要分類」（每張只算一次，加總 = 待審核總數）、即時處理流程、逐階段列出待處理數。（DB-）
+- 修正：評估期間取消不再誤報「已取消」（評估不可取消）；任務進行中儲存設定或還原預設時，先回 409 才寫入。
+
+## v0.5 — 2026-10-14
+
+- **資料安全**：Keeper 保護改為以資產為單位檢查所屬的每個群組（封住三種繞過方式）；刪除前最後一道防線；刪前校驗改為大小**或**修改時間任一不符就不刪；永久刪除需帶 `confirm_text`，分析或評估進行中不能刪除。
+- **不再寫入假資料**：任何失敗寫入 `analysis_failures`，不再用隨機向量、假 pHash 冒充成功。
+- **GPU 批次 CLIP 管線**：loader 執行緒 → 單一批次推理 → 背景批次寫入；顯存不足自動減半；補邊成正方形再縮放；`scripts/bench_clip.py` 測速。
+- **basic 階段每張相片只解碼一次**；模糊 / pHash / 亮度改在最長邊 1024px 的縮小圖上計算（模糊門檻的意義因此改變）；拍攝時間改讀 EXIF `DateTimeOriginal`。
+- **近似重複與連拍**改為向量化規則引擎（`near_dup_method`、`clip_dup_threshold`、`near_dup_max_group`；連拍規則；影片的完全重複與極小影片規則）；每個資產只屬於一個群組。
+- **任務與本機安全**：任務啟動原子化、SSE thread-safe；只接受本機 Host，拒絕其他網站來源的寫入請求；設定預設值集中到 `core/defaults.py` 並驗證；SQLite WAL 與連線池調整；CUDA 安裝依顯示卡自動挑選版本（RTX 50 系列使用 cu128）。
+- 測試改用暫存資料庫與假 CLIP 後端，並新增 Keeper 保護、刪前校驗、失敗處理、OOM 減半、近似分組、任務互斥、安全防護與設定驗證等測試。
+
+## v0.4 及更早
+
+初版功能（Library / Review / Process / History / Settings / Dashboard）、AI 語義分類，以及 v0.4 的掃描與分析拆分，沒有逐版的變更紀錄；見 git 歷史。
