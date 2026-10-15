@@ -19,15 +19,19 @@ import {
   BulkFilter,
   BulkPreview,
   CategoryKey,
+  GroupInfo,
+  GroupMember,
   KeeperMode,
   ReviewItem,
   ReviewState,
   ReviewSummary,
   SortKey,
+  previewUrl,
   reviewApi,
 } from '../services/reviewApi'
 import { ReviewCard, CARD_PAD, cardMetaHeight } from '../components/review/ReviewCard'
 import { ConfirmDialog, SampleThumb } from '../components/review/ConfirmDialog'
+import { PreviewModal } from '../components/review/PreviewModal'
 import {
   CATEGORIES,
   WAIVABLE_CATEGORIES,
@@ -38,13 +42,14 @@ import {
 import { REVIEW_FILTERS_COLLAPSED_KEY, useLayoutPref } from '../hooks/useLayoutPref'
 
 /* ────────────────────────────────────────────────────────────
- * 審核工作台（v0.6.4）
+ * 審核工作台（v0.6.5）
  * - 一次只向後端要一頁（200 張），捲到底再載入下一頁；統計與分頁都在後端完成
  * - 狀態變更直接更新畫面（不重新載入、不丟失捲動位置），並提供「復原」
  * - 「選取符合條件的全部 N 張」：依條件在後端批次處理，先預覽（張數、容量、隨機抽樣）再確認
  * - 螢幕截圖 / 文件分類：不受「群組至少保留一張」保護（使用者決定）
- * - v0.6.4：左側篩選欄可收合成窄欄（只留圖示與數量），讓卡片區最大化；
- *   主選單的收合在 AppShell，按 [ 可一次收合 / 展開兩者
+ * - 左側篩選欄可收合成窄欄；主選單的收合在 AppShell，按 [ 可一次收合 / 展開兩者
+ * - v0.6.5：大圖預覽（雙擊卡片 / 縮圖右上角放大鏡 / 空白鍵）：左右鍵切換、D / K / R 直接決定並跳到下一張、
+ *   100% 檢視、檔案與偵測資訊、重複群組成員（點選即可切換比對）
  * ──────────────────────────────────────────────────────────── */
 
 const PAGE = 200
@@ -132,6 +137,31 @@ function readCols(): number {
     /* ignore */
   }
   return 5
+}
+
+/** 群組成員（可能不在目前的審核清單裡）轉成預覽用的 ReviewItem */
+function memberToItem(m: GroupMember, g: GroupInfo | null): ReviewItem {
+  return {
+    id: m.asset_id,
+    asset_id: m.asset_id,
+    filename: m.filename,
+    primary_path: m.primary_path,
+    media_type: m.media_type,
+    size_total: m.size_total,
+    rule: m.rules[0] ?? '',
+    rules: m.rules,
+    reason: '',
+    reasons: [],
+    score: m.score,
+    group_id: g ? g.group_id : null,
+    group_size: g ? g.members.length : null,
+    is_keeper: m.is_keeper,
+    state: m.state,
+    thumbnail_url: m.thumbnail_url,
+    width: m.width,
+    height: m.height,
+    taken_at: null,
+  }
 }
 
 export const Review: React.FC = () => {
@@ -277,10 +307,16 @@ export const Review: React.FC = () => {
     return s
   }, [selection, items])
 
-  // 篩選條件改變：清掉選取、回到頂端、重新載入第一頁
+  const [previewId, setPreviewId] = useState<number | null>(null)
+  // 最後一張「在清單裡」的預覽相片：左右鍵、位置顯示都從這裡接著走（從群組點到清單外的成員比對時也一樣）
+  const [anchorId, setAnchorId] = useState<number | null>(null)
+
+  // 篩選條件改變：清掉選取、關閉預覽、回到頂端、重新載入第一頁
   const parentRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
     clearSel()
+    setPreviewId(null)
+    setAnchorId(null)
     parentRef.current?.scrollTo({ top: 0 })
     void fetchFirst({ reset: true })
   }, [fetchFirst, clearSel])
@@ -339,6 +375,106 @@ export const Review: React.FC = () => {
   const [busy, setBusy] = useState(false)
   const [dialog, setDialog] = useState<DialogState | null>(null)
 
+  /* ───────── 大圖預覽 ───────── */
+  const [previewExtra, setPreviewExtra] = useState<ReviewItem | null>(null)
+  const [group, setGroup] = useState<GroupInfo | null>(null)
+  const [groupLoading, setGroupLoading] = useState(false)
+  const [groupVersion, setGroupVersion] = useState(0)
+
+  const previewItem = useMemo(() => {
+    if (previewId === null) return null
+    return (
+      items.find((i) => i.asset_id === previewId) ??
+      (previewExtra && previewExtra.asset_id === previewId ? previewExtra : null)
+    )
+  }, [previewId, items, previewExtra])
+  const anchorIndex = useMemo(() => (anchorId === null ? -1 : items.findIndex((i) => i.asset_id === anchorId)), [anchorId, items])
+  const previewInList = previewItem !== null && items.some((i) => i.asset_id === previewItem.asset_id)
+  const comparing = previewItem !== null && previewItem.asset_id !== anchorId
+
+  // 目前顯示的相片不在清單了（例如換了篩選）→ 關閉
+  useEffect(() => {
+    if (previewId !== null && previewItem === null) setPreviewId(null)
+  }, [previewId, previewItem])
+
+  const openPreview = useCallback((item: ReviewItem) => {
+    setPreviewExtra(null)
+    setPreviewId(item.asset_id)
+    setAnchorId(item.asset_id)
+  }, [])
+  const closePreview = useCallback(() => {
+    setPreviewId(null)
+    setAnchorId(null)
+    setPreviewExtra(null)
+  }, [])
+  const stepPreview = (delta: number) => {
+    if (anchorIndex < 0) return
+    const next = items[anchorIndex + delta]
+    if (!next) return
+    setPreviewExtra(null)
+    setPreviewId(next.asset_id)
+    setAnchorId(next.asset_id)
+  }
+  const pickMember = (m: GroupMember) => {
+    const inList = items.find((i) => i.asset_id === m.asset_id)
+    if (inList) {
+      setPreviewExtra(null)
+      setAnchorId(inList.asset_id)
+      setPreviewId(inList.asset_id)
+      return
+    }
+    setPreviewExtra(memberToItem(m, group))
+    setPreviewId(m.asset_id)
+  }
+  const openLast = () => {
+    const list = itemsRef.current
+    if (list.length === 0) return
+    const it = list[Math.min(lastIndex.current ?? 0, list.length - 1)]
+    if (it) openPreview(it)
+  }
+
+  // 群組成員（目前這張相片屬於某個重複群組時）
+  const groupId = previewItem ? previewItem.group_id : null
+  useEffect(() => {
+    if (groupId === null) {
+      setGroup(null)
+      setGroupLoading(false)
+      return
+    }
+    let dead = false
+    setGroup((prev) => (prev && prev.group_id === groupId ? prev : null))
+    setGroupLoading(true)
+    reviewApi
+      .group(groupId)
+      .then((g) => {
+        if (!dead) setGroup(g)
+      })
+      .catch(() => {
+        if (!dead) setGroup(null)
+      })
+      .finally(() => {
+        if (!dead) setGroupLoading(false)
+      })
+    return () => {
+      dead = true
+    }
+  }, [groupId, groupVersion])
+
+  // 快看到清單尾端時先載入下一頁
+  useEffect(() => {
+    if (previewId === null || anchorIndex < 0) return
+    if (hasMore && !loading && !loadingMore && anchorIndex >= items.length - 4) void loadMore()
+  }, [previewId, anchorIndex, items.length, hasMore, loading, loadingMore, loadMore])
+
+  const neighborUrls = useMemo(() => {
+    if (anchorIndex < 0) return []
+    return [1, 2, -1]
+      .map((d) => items[anchorIndex + d])
+      .filter((i): i is ReviewItem => !!i)
+      .map((i) => previewUrl(i.asset_id, i.thumbnail_url))
+  }, [anchorIndex, items])
+
+  /* ───────── 動作 ───────── */
   const announce = (target: ReviewState, updated: number, protectedCount: number, undo: string | null) => {
     let text = `已將 ${updated.toLocaleString()} 張${TARGET_TEXT[target]}`
     if (protectedCount > 0) text += `（🛡️ ${protectedCount} 張因「群組至少保留一張」而保留）`
@@ -352,6 +488,7 @@ export const Review: React.FC = () => {
         const r = await reviewApi.undo(token)
         dismissToast()
         await refreshWindow(r.restored_count)
+        setGroupVersion((v) => v + 1)
         refreshSummarySoon()
         showToast({ text: `已復原 ${r.restored_count.toLocaleString()} 張`, tone: 'ok', undo: null }, 4000)
       } catch (e) {
@@ -363,28 +500,59 @@ export const Review: React.FC = () => {
     [dismissToast, refreshWindow, refreshSummarySoon, showToast],
   )
 
-  /* ───────── 動作 ───────── */
   const waiveFor = (target: ReviewState): 'screenshot' | 'document' | undefined =>
     target === 'queued' && WAIVABLE_CATEGORIES.includes(category) ? (category as 'screenshot' | 'document') : undefined
 
   const bulkFilter = (): BulkFilter => ({ category, state: activeState, min_score: effMin })
 
-  const applyIds = async (ids: number[], target: ReviewState) => {
+  /** 變更狀態並直接更新畫面；回傳「已從清單移除」的資產（被群組保護擋下的不在內） */
+  const applyIds = async (ids: number[], target: ReviewState, opts?: { keepSelection?: boolean }): Promise<Set<number>> => {
     setBusy(true)
     try {
       const res = await reviewApi.setState(ids, target, waiveFor(target))
       const blocked = new Set(res.protected_asset_ids)
       const removed = new Set(ids.filter((id) => !blocked.has(id)))
+      const inList = new Set(itemsRef.current.map((i) => i.asset_id))
+      let removedInList = 0
+      removed.forEach((id) => {
+        if (inList.has(id)) removedInList++
+      })
       epoch.current++
       setItems((prev) => prev.filter((i) => !removed.has(i.asset_id)))
-      setTotal((t) => Math.max(0, t - removed.size))
-      clearSel()
+      setTotal((t) => Math.max(0, t - removedInList))
+      if (opts?.keepSelection) {
+        setSelection((prev) =>
+          prev.mode === 'ids' ? { mode: 'ids', ids: new Set(Array.from(prev.ids).filter((id) => !removed.has(id))) } : prev,
+        )
+      } else {
+        clearSel()
+      }
       refreshSummarySoon()
       announce(target, res.updated_count, res.protected_count, res.undo_token)
+      return removed
     } catch (e) {
       showToast({ text: errMsg(e), tone: 'err', undo: null }, 8000)
+      return new Set<number>()
     } finally {
       setBusy(false)
+    }
+  }
+
+  /** 在預覽裡決定這一張：成功後自動跳到下一張（沒有下一張就跳到上一張，都沒有就關閉） */
+  const previewAct = async (target: ReviewState) => {
+    if (busy || dialog || !previewItem || anchorIndex < 0 || comparing) return
+    const cur = previewItem
+    const nextItem = items[anchorIndex + 1] ?? items[anchorIndex - 1] ?? null
+    const removed = await applyIds([cur.asset_id], target, { keepSelection: true })
+    setGroupVersion((v) => v + 1)
+    if (removed.has(cur.asset_id)) {
+      if (nextItem) {
+        setPreviewExtra(null)
+        setPreviewId(nextItem.asset_id)
+        setAnchorId(nextItem.asset_id)
+      } else {
+        closePreview()
+      }
     }
   }
 
@@ -457,8 +625,8 @@ export const Review: React.FC = () => {
   }
 
   /* ───────── 鍵盤 ───────── */
-  const kb = useRef({ runAction, doUndo, toast, dialogOpen: false, selectLoaded, clearSel })
-  kb.current = { runAction, doUndo, toast, dialogOpen: dialog !== null, selectLoaded, clearSel }
+  const kb = useRef({ runAction, doUndo, toast, dialogOpen: false, previewOpen: false, selectLoaded, clearSel, openLast })
+  kb.current = { runAction, doUndo, toast, dialogOpen: dialog !== null, previewOpen: previewItem !== null, selectLoaded, clearSel, openLast }
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement | null
@@ -466,11 +634,7 @@ export const Review: React.FC = () => {
       const k = kb.current
       if (k.dialogOpen) return
       const key = e.key.toLowerCase()
-      if ((e.ctrlKey || e.metaKey) && key === 'a') {
-        e.preventDefault()
-        k.selectLoaded(true)
-        return
-      }
+      // 復原在預覽開著時也要能用；其他按鍵在預覽開著時由預覽自己處理
       if ((e.ctrlKey || e.metaKey) && key === 'z') {
         if (k.toast?.undo) {
           e.preventDefault()
@@ -478,9 +642,20 @@ export const Review: React.FC = () => {
         }
         return
       }
+      if (k.previewOpen) return
+      if ((e.ctrlKey || e.metaKey) && key === 'a') {
+        e.preventDefault()
+        k.selectLoaded(true)
+        return
+      }
       if (e.ctrlKey || e.metaKey || e.altKey) return
+      // 焦點在按鈕 / 連結上時，空白鍵與 Enter 留給它們自己
+      if ((key === ' ' || key === 'enter') && el && ['BUTTON', 'A'].includes(el.tagName)) return
       if (key === 'escape') k.clearSel()
-      else if (key === 'd') k.runAction('queued')
+      else if (key === ' ' || key === 'enter') {
+        e.preventDefault()
+        k.openLast()
+      } else if (key === 'd') k.runAction('queued')
       else if (key === 'k') k.runAction('kept')
       else if (key === 'r') k.runAction('candidate')
     }
@@ -523,6 +698,18 @@ export const Review: React.FC = () => {
   useEffect(() => {
     if (hasMore && !loading && !loadingMore && lastRow >= itemRows - 3) void loadMore()
   }, [lastRow, itemRows, hasMore, loading, loadingMore, loadMore])
+
+  // 預覽切到別張時，讓清單裡對應的卡片保持在畫面內（關閉預覽後就停在這裡）
+  useEffect(() => {
+    if (previewId === null || anchorIndex < 0) return
+    const el = parentRef.current
+    if (!el) return
+    const top = Math.floor(anchorIndex / cols) * rowH
+    if (top < el.scrollTop || top + cardH > el.scrollTop + el.clientHeight) {
+      el.scrollTo({ top: Math.max(0, top - (el.clientHeight - cardH) / 2) })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [anchorId])
 
   const changeCols = (n: number) => {
     setCols(n)
@@ -708,11 +895,13 @@ export const Review: React.FC = () => {
 
           <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-3 text-[11px] leading-relaxed text-slate-500">
             <div className="mb-1 font-semibold text-slate-400">快速鍵</div>
+            <div><kbd className="text-slate-300">雙擊</kbd> 卡片或 <kbd className="text-slate-300">空白鍵</kbd>：預覽大圖</div>
+            <div><kbd className="text-slate-300">←</kbd> <kbd className="text-slate-300">→</kbd>：預覽中切換；<kbd className="text-slate-300">F</kbd> 放大 <kbd className="text-slate-300">I</kbd> 資訊</div>
             <div><kbd className="text-slate-300">[</kbd>：收合 / 展開所有側邊欄（專注模式）</div>
             <div><kbd className="text-slate-300">Shift</kbd>＋點選：範圍選取</div>
             <div><kbd className="text-slate-300">Ctrl</kbd>＋<kbd className="text-slate-300">A</kbd>：選取已載入（跳過 Keeper）</div>
             <div><kbd className="text-slate-300">D</kbd> 加入待刪　<kbd className="text-slate-300">K</kbd> 保留　<kbd className="text-slate-300">R</kbd> 恢復</div>
-            <div><kbd className="text-slate-300">Ctrl</kbd>＋<kbd className="text-slate-300">Z</kbd>：復原　<kbd className="text-slate-300">Esc</kbd>：取消選取</div>
+            <div><kbd className="text-slate-300">Ctrl</kbd>＋<kbd className="text-slate-300">Z</kbd>：復原　<kbd className="text-slate-300">Esc</kbd>：取消選取 / 關閉預覽</div>
           </div>
         </aside>
       )}
@@ -938,6 +1127,7 @@ export const Review: React.FC = () => {
                         thumbH={thumbH}
                         height={cardH}
                         onToggle={onToggle}
+                        onPreview={openPreview}
                       />
                     ))}
                   </div>
@@ -948,9 +1138,9 @@ export const Review: React.FC = () => {
         </div>
       </section>
 
-      {/* 通知與復原 */}
+      {/* 通知與復原（在預覽的上層，預覽裡按 D / K / R 後一樣看得到「復原」） */}
       {toast && (
-        <div className="fixed bottom-6 left-1/2 z-40 -translate-x-1/2">
+        <div className={`fixed left-1/2 z-[60] -translate-x-1/2 ${previewItem ? 'bottom-20' : 'bottom-6'}`}>
           <div
             className={`flex items-center gap-3 rounded-xl border px-4 py-2.5 text-xs shadow-2xl ${
               toast.tone === 'ok'
@@ -976,6 +1166,28 @@ export const Review: React.FC = () => {
             </button>
           </div>
         </div>
+      )}
+
+      {/* 大圖預覽 */}
+      {previewItem && (
+        <PreviewModal
+          item={previewItem}
+          position={anchorIndex >= 0 ? { index: anchorIndex + 1, total } : null}
+          comparing={comparing}
+          hasPrev={anchorIndex > 0}
+          hasNext={anchorIndex >= 0 && anchorIndex < items.length - 1}
+          actions={ACTIONS[previewItem.state]}
+          actionsEnabled={previewInList && !comparing}
+          busy={busy}
+          group={group}
+          groupLoading={groupLoading}
+          neighborUrls={neighborUrls}
+          onClose={closePreview}
+          onPrev={() => stepPreview(-1)}
+          onNext={() => stepPreview(1)}
+          onAction={(t) => void previewAct(t)}
+          onPickMember={pickMember}
+        />
       )}
 
       {/* 批次確認 */}

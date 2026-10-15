@@ -265,3 +265,13 @@ def evaluate_rules():
     from app.api.jobs import run_evaluate_now
     counts = run_evaluate_now()
     return {"status": "ok", "message": "已重新評估所有規則並產出候選項目", "counts": counts}
+
+
+# ─────────────────────────────────────────────
+# v0.6.5：大圖預覽與群組成員（定義在 api/preview.py，掛在同一個 router 底下）
+#   GET /api/candidates/preview/{asset_id}
+#   GET /api/candidates/group/{group_id}
+# ─────────────────────────────────────────────
+from app.api import preview as _preview  # noqa: E402
+
+router.include_router(_preview.router)

@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { Check, ShieldCheck } from 'lucide-react'
+import { Check, Maximize2, ShieldCheck } from 'lucide-react'
 import { formatBytes } from '../../services/workflow'
 import { ReviewItem } from '../../services/reviewApi'
 import { ruleBadge, SCORE_AS_PERCENT_RULES } from './reviewMeta'
@@ -16,6 +16,8 @@ interface Props {
   thumbH: number
   height: number
   onToggle: (item: ReviewItem, index: number, e: React.MouseEvent) => void
+  /** v0.6.5：開啟大圖預覽（雙擊卡片、縮圖右上角的放大鏡、或按空白鍵） */
+  onPreview: (item: ReviewItem) => void
 }
 
 const Thumb: React.FC<{ url: string; name: string }> = ({ url, name }) => {
@@ -40,7 +42,7 @@ const Thumb: React.FC<{ url: string; name: string }> = ({ url, name }) => {
   )
 }
 
-export const ReviewCard: React.FC<Props> = ({ item, index, selected, compact, thumbH, height, onToggle }) => {
+export const ReviewCard: React.FC<Props> = ({ item, index, selected, compact, thumbH, height, onToggle, onPreview }) => {
   const rules = item.rules.length > 0 ? item.rules : [item.rule]
   const shownRules = rules.slice(0, compact ? 1 : 2)
   const extraRules = rules.length - shownRules.length
@@ -58,9 +60,12 @@ export const ReviewCard: React.FC<Props> = ({ item, index, selected, compact, th
   return (
     <div
       onClick={(e) => onToggle(item, index, e)}
+      onDoubleClick={() => onPreview(item)}
       style={{ height }}
-      className={`relative flex select-none flex-col gap-2 overflow-hidden rounded-2xl border p-[8px] cursor-pointer transition-colors ${frame}`}
-      title={`${item.primary_path}\n\n${allReasons}`}
+      data-card="1"
+      data-asset-id={item.asset_id}
+      className={`group relative flex select-none flex-col gap-2 overflow-hidden rounded-2xl border p-[8px] cursor-pointer transition-colors ${frame}`}
+      title={`${item.primary_path}\n\n${allReasons}\n\n雙擊或按空白鍵預覽大圖`}
     >
       {/* 縮圖 */}
       <div className="relative w-full shrink-0 overflow-hidden rounded-xl bg-slate-950" style={{ height: thumbH }}>
@@ -78,12 +83,28 @@ export const ReviewCard: React.FC<Props> = ({ item, index, selected, compact, th
           )}
         </div>
 
-        {item.is_keeper && (
-          <span className="absolute right-1.5 top-1.5 flex items-center gap-1 rounded-md bg-emerald-600/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-            <ShieldCheck className="h-3 w-3" />
-            {compact ? '' : '建議保留'}
-          </span>
-        )}
+        <div className="absolute right-1.5 top-1.5 flex items-center gap-1">
+          {item.is_keeper && (
+            <span className="flex items-center gap-1 rounded-md bg-emerald-600/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+              <ShieldCheck className="h-3 w-3" />
+              {compact ? '' : '建議保留'}
+            </span>
+          )}
+          <button
+            type="button"
+            aria-label="預覽大圖"
+            title="預覽大圖（雙擊卡片或按空白鍵）"
+            data-preview-btn="1"
+            onClick={(e) => {
+              e.stopPropagation()
+              onPreview(item)
+            }}
+            onDoubleClick={(e) => e.stopPropagation()}
+            className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-900/80 text-slate-200 opacity-0 transition-opacity hover:bg-sky-600 focus:opacity-100 group-hover:opacity-100 cursor-pointer"
+          >
+            <Maximize2 className="h-3.5 w-3.5" />
+          </button>
+        </div>
 
         {item.group_id && (
           <span className="absolute bottom-1.5 left-1.5 rounded-md bg-slate-900/85 px-1.5 py-0.5 text-[10px] font-medium text-slate-200">

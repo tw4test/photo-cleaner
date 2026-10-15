@@ -1,4 +1,4 @@
-// v0.6.3：審核頁用的型別與 API（獨立於 api.ts / types.ts，不修改既有檔案）
+// 審核頁用的型別與 API（獨立於 api.ts / types.ts，不修改既有檔案）
 import { ApiError } from './settingsApi'
 
 export type ReviewState = 'candidate' | 'queued' | 'kept'
@@ -97,6 +97,30 @@ export interface BulkResult extends StatusResult {
   size_bytes: number
 }
 
+/** v0.6.5：重複群組的成員（含各種狀態，Keeper 排最前面） */
+export interface GroupMember {
+  asset_id: number
+  filename: string
+  primary_path: string
+  media_type: string
+  size_total: number
+  width: number | null
+  height: number | null
+  /** 清晰度（Laplacian 變異數，越高越清晰）；沒有分析過是 null */
+  sharpness: number | null
+  is_keeper: boolean
+  state: ReviewState
+  score: number
+  rules: string[]
+  thumbnail_url: string
+}
+
+export interface GroupInfo {
+  group_id: number
+  type: string | null
+  members: GroupMember[]
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
     ...init,
@@ -117,6 +141,12 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 const post = <T>(url: string, body: unknown) => request<T>(url, { method: 'POST', body: JSON.stringify(body) })
 
+/** 大圖網址。沿用縮圖網址裡的 ?v=mtime，檔案變動時瀏覽器才會重新抓 */
+export function previewUrl(assetId: number, thumbnailUrl: string): string {
+  const m = /[?&]v=([^&]+)/.exec(thumbnailUrl)
+  return `/api/candidates/preview/${assetId}${m ? `?v=${m[1]}` : ''}`
+}
+
 export const reviewApi = {
   summary: (state: ReviewState) => request<ReviewSummary>(`/api/candidates/summary?state=${state}`),
 
@@ -132,6 +162,8 @@ export const reviewApi = {
     if (q.min_score !== undefined) p.set('min_score', String(q.min_score))
     return request<ReviewPage>(`/api/candidates/page?${p.toString()}`)
   },
+
+  group: (groupId: number) => request<GroupInfo>(`/api/candidates/group/${groupId}`),
 
   /** 以資產 id 變更狀態。waive：在「螢幕截圖 / 文件」分類操作時帶入，該規則的相片不受群組保護 */
   setState: (assetIds: number[], state: ReviewState, waive?: 'screenshot' | 'document') =>
