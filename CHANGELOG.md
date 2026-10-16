@@ -2,6 +2,20 @@
 
 新的在上。每一版只記重點；需求的完整描述在 [`docs/functional-spec.md`](docs/functional-spec.md)，逐版的詳細說明（含舊的安裝步驟）封存在 [`docs/archive/`](docs/archive/)。
 
+## v0.7.0 — 2026-10-16
+
+- **所有影片頁**（`/videos`，VD-01 至 VD-06）：列出資料庫裡所有影片（不論有沒有命中規則），搜尋、依名稱 / 日期 / 大小 / 時長 / 解析度排序、無限捲動；只讀，不能加入待刪。入口在主選單與審核頁篩選欄（展開與收合都有）。新 API：`GET /api/videos`、`GET /api/videos/summary`。
+- **影片播放器**（VD-10 至 VD-13）：原檔 HTTP Range 串流；播放 / 暫停、音量、倍速、劇院模式、子母畫面、全螢幕與鍵盤（`←` `→` 快轉；`Shift` + `←` `→` 或 `PageUp` / `PageDown` 上一支 / 下一支）。新 API：`GET /api/videos/{id}/info`、`/stream`、`/transcoded`。
+- **ffmpeg 轉檔**（VD-14 至 VD-17）：AVI / WMV / FLV 等瀏覽器播不了的影片，按「轉檔後播放」轉成 H.264 MP4（最高 1080p），有進度、可取消，關閉播放器 / 換片 / 關閉分頁自動取消；取消用 `proc.kill()`（不用 `terminate()`，ffmpeg 收到 SIGTERM 會先轉完整支）。結果存 `DATA_DIR/video_cache`（上限 5 GB，依最近使用淘汰），原檔不動。**ffmpeg 是選用的**，沒有時顯示安裝說明，其他功能不受影響。新 API：`POST /api/videos/{id}/transcode`、`GET /api/videos/{id}/transcode`、`POST /api/videos/{id}/transcode/cancel`、`GET /api/videos/ffmpeg`。新環境變數：`FFMPEG_PATH`、`FFPROBE_PATH`、`VIDEO_CACHE_MAX_BYTES`、`VIDEO_TRANSCODE_MAX_HEIGHT`。
+- **HEVC 先試播，失敗才提示轉檔**（VD-11）：HEVC 與 10-bit H.264 能不能播取決於使用者的瀏覽器與顯示卡，所以先播原檔；播得出來就不出現任何提示。沒有 HEVC 解碼器的瀏覽器常常只播出聲音、不觸發 `error`，前端播放約 1.5 秒後檢查 `videoWidth` 與解碼畫格數，沒有影像才提示。`GET /api/videos/{id}/info` 新增 `playback`（`direct` / `try_first` / `transcode`）。
+- **審核頁影片預覽**（VD-20）：影片候選改用同一個播放器；`D` / `K` / `R` 的行為與大圖預覽相同（只處理目前這一支、跳到下一個、`Ctrl+Z` 復原）。圖片預覽也支援 `PageUp` / `PageDown`，圖片與影片之間可直接切換。
+- **ffmpeg 備援**（VD-21、VD-22）：影片縮圖與 `GET /api/candidates/preview/{asset_id}` 在 OpenCV 讀不到第一幀時改用 ffmpeg 抽幀；video 分析階段在 OpenCV 打不開或缺時長 / 解析度時改用 ffprobe 補讀。
+- **影片分數不是 AI 信心度**（VD-30）：`video_same_size` 固定 1.0、`video_tiny` 固定 0.7（規則本來就是這樣，這版改成命名常數並寫進規格）。預覽不再顯示影片的分數，影片分類沒有「分數」排序選項。
+- **進度卡片**（UI-07、UI-08、AN-10）：一鍵流水線有自己的六個步驟並隨階段前進；完成後不再顯示「正在處理中」與最後一個階段的 N / N；完成摘要依各階段回傳的欄位計算（hash: done / not_needed；basic: done；clip / video: processed）；分析頁在任務進行中每 2 秒更新；卡片高度回報給頁面、頁面底部依高度留白；卡片位置跟著主選單收合。修正：後端預設的空 `scan_summary` / `stage_stats` 被當成有資料（分析完成時多出空的掃描摘要）、單獨評估完成時不顯示摘要。
+- **更名與版本**：頁面標題（`index.html`）與後端應用程式名稱改為「相片清理助手」，後端版本 0.7.0。
+- 新增 `npm run test:logic`（播放器按鍵、進度卡片等純邏輯的測試，不需額外套件）。
+- 文件：規格書新增 4.12（VD-）、UI-07、UI-08、AN-10 與對應的驗收條件，G-4 的「影片播放」已完成，新增 G-9、G-10；`docs/operations.md` 新增第 4 節（ffmpeg），後面的章節順延；兩份 README、`AGENT.md` 同步。
+
 ## v0.6.5 — 2026-10-15
 
 - **大圖預覽**：雙擊卡片、縮圖放大鏡或空白鍵開啟；`←` `→` 沿清單切換；預覽中 `D` / `K` / `R` 只處理目前這一張並跳到下一張；點圖或 `F` 切換適合視窗 / 100%；資訊欄含偵測原因與重複群組的所有成員，可切換比較畫質。（PV-）

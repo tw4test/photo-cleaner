@@ -8,7 +8,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from app.core.config import settings
 from app.core.database import init_db
 from app.api import roots, scan, thumbnails, dashboard, candidates, process, history, settings as app_settings
-from app.api import jobs, analysis, system, workflow
+from app.api import jobs, analysis, system, workflow, videos
 from app.services.cuda_manager import cuda_manager
 
 ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:8000", "http://localhost:8000"]
@@ -18,10 +18,13 @@ ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver"]
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    from app.services import video_transcode
+    video_transcode.cleanup_partials()      # 上次異常結束留下的轉檔半成品
     yield
+    video_transcode.shutdown()              # 結束時殺掉還在跑的 ffmpeg，不留孤兒行程
 
 
-app = FastAPI(title=settings.APP_NAME, description="本地相片瘦身工具後端 API（綁定 127.0.0.1）",
+app = FastAPI(title=settings.APP_NAME, description="相片清理助手後端 API（綁定 127.0.0.1）",
               version=settings.APP_VERSION, lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["*"],
@@ -40,7 +43,7 @@ async def origin_guard(request: Request, call_next):
     return await call_next(request)
 
 
-for r in (roots, scan, thumbnails, dashboard, candidates, process, history, app_settings, jobs, analysis, system, workflow):
+for r in (roots, scan, thumbnails, dashboard, candidates, process, history, app_settings, jobs, analysis, system, workflow, videos):
     app.include_router(r.router)
 
 

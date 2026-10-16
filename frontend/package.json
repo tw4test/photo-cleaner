@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:logic": "node scripts/test-logic.mjs"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.2",

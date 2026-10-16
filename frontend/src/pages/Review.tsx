@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   ArrowRight,
   CheckCircle2,
+  Film,
   Filter,
   Loader2,
   PanelLeftClose,
@@ -15,6 +16,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { formatBytes } from '../services/workflow'
+import { VideoSummary, videoApi } from '../services/videoApi'
 import {
   BulkFilter,
   BulkPreview,
@@ -32,6 +34,8 @@ import {
 import { ReviewCard, CARD_PAD, cardMetaHeight } from '../components/review/ReviewCard'
 import { ConfirmDialog, SampleThumb } from '../components/review/ConfirmDialog'
 import { PreviewModal } from '../components/review/PreviewModal'
+import { VideoReviewViewer } from '../components/review/VideoReviewViewer'
+import { resolveSort, sortOffersScore } from '../components/video/videoReviewLogic'
 import {
   CATEGORIES,
   WAIVABLE_CATEGORIES,
@@ -174,8 +178,14 @@ export const Review: React.FC = () => {
   const [debouncedMin, setDebouncedMin] = useState(MIN_OFF)
   const [cols, setCols] = useState<number>(readCols)
   const [filtersCollapsed, , toggleFilters] = useLayoutPref(REVIEW_FILTERS_COLLAPSED_KEY)
+  // v0.7.0：「所有影片」入口顯示的影片總數（只讀頁面，不影響審核清單）
+  const [videoCount, setVideoCount] = useState<VideoSummary | null>(null)
+  useEffect(() => {
+    videoApi.summary().then(setVideoCount).catch(() => {})
+  }, [])
 
-  const sort: SortKey = sortChoice ?? defaultSort(category)
+  // 影片分類沒有分數可排（VD-30）：在別的分類選過「分數」時，切到影片分類退回預設排序
+  const sort: SortKey = resolveSort(category, sortChoice, defaultSort(category))
   const keepers: KeeperMode = keepersChoice ?? defaultKeepers(category)
   const effMin = isAi(category) && debouncedMin > MIN_OFF + 1e-9 ? debouncedMin : undefined
 
@@ -470,7 +480,7 @@ export const Review: React.FC = () => {
     if (anchorIndex < 0) return []
     return [1, 2, -1]
       .map((d) => items[anchorIndex + d])
-      .filter((i): i is ReviewItem => !!i)
+      .filter((i): i is ReviewItem => !!i && i.media_type !== 'video')
       .map((i) => previewUrl(i.asset_id, i.thumbnail_url))
   }, [anchorIndex, items])
 
@@ -786,6 +796,18 @@ export const Review: React.FC = () => {
           })}
 
           <div className="my-1 w-6 border-t border-slate-800" />
+          <Link
+            to="/videos"
+            title={`所有影片（只讀瀏覽與播放）${videoCount ? `：${videoCount.count.toLocaleString()} 支（${formatBytes(videoCount.total_size)}）` : ''}`}
+            aria-label="所有影片"
+            data-testid="review-all-videos"
+            className="flex h-11 w-11 shrink-0 flex-col items-center justify-center gap-0.5 rounded-xl border border-transparent text-slate-400 transition-all hover:bg-slate-800/40 hover:text-slate-200"
+          >
+            <Film className="h-4 w-4" />
+            <span className="font-mono text-[9px] leading-none">{videoCount ? compactCount(videoCount.count) : '—'}</span>
+          </Link>
+
+          <div className="my-1 w-6 border-t border-slate-800" />
           {STATE_TABS.map((t) => (
             <button
               key={t.key}
@@ -864,6 +886,22 @@ export const Review: React.FC = () => {
               一張相片可能同時符合多個分類，所以分類數量加總可能大於「全部」。
             </p>
           </div>
+
+          <Link
+            to="/videos"
+            data-testid="review-all-videos"
+            title="瀏覽並播放資料庫裡所有影片（只讀，不能加入待刪）"
+            className="flex items-center gap-2.5 rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2 text-xs font-medium text-slate-300 transition-all hover:border-slate-600 hover:text-slate-100"
+          >
+            <Film className="h-4 w-4 shrink-0 text-sky-400" />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate">所有影片</span>
+              <span className="block text-[10px] font-normal text-slate-500">
+                {videoCount ? formatBytes(videoCount.total_size) : '只讀瀏覽與播放'}
+              </span>
+            </span>
+            <span className="shrink-0 font-mono text-[11px]">{videoCount ? videoCount.count.toLocaleString() : '—'}</span>
+          </Link>
 
           <div>
             <h5 className="mb-2 text-xs font-semibold text-slate-400">審核狀態</h5>
@@ -980,7 +1018,7 @@ export const Review: React.FC = () => {
               onChange={(e) => setSortChoice(e.target.value as SortKey)}
               className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 focus:border-sky-500 focus:outline-none cursor-pointer"
             >
-              <option value="score">分數（高 → 低）</option>
+              {sortOffersScore(category) && <option value="score">分數（高 → 低）</option>}
               <option value="size">檔案大小（大 → 小）</option>
               <option value="group">重複群組</option>
               <option value="path">路徑</option>
@@ -1140,7 +1178,13 @@ export const Review: React.FC = () => {
 
       {/* 通知與復原（在預覽的上層，預覽裡按 D / K / R 後一樣看得到「復原」） */}
       {toast && (
-        <div className={`fixed left-1/2 z-[60] -translate-x-1/2 ${previewItem ? 'bottom-20' : 'bottom-6'}`}>
+        <div
+          className={`fixed z-[60] ${
+            previewItem && previewItem.media_type === 'video'
+              ? 'left-4 top-16'          // 影片播放視窗：底部是播放器控制列，通知改放左上角
+              : `left-1/2 -translate-x-1/2 ${previewItem ? 'bottom-20' : 'bottom-6'}`
+          }`}
+        >
           <div
             className={`flex items-center gap-3 rounded-xl border px-4 py-2.5 text-xs shadow-2xl ${
               toast.tone === 'ok'
@@ -1169,7 +1213,26 @@ export const Review: React.FC = () => {
       )}
 
       {/* 大圖預覽 */}
-      {previewItem && (
+      {previewItem && previewItem.media_type === 'video' && (
+        <VideoReviewViewer
+          item={previewItem}
+          position={anchorIndex >= 0 ? { index: anchorIndex + 1, total } : null}
+          comparing={comparing}
+          hasPrev={anchorIndex > 0}
+          hasNext={anchorIndex >= 0 && anchorIndex < items.length - 1}
+          actions={ACTIONS[previewItem.state]}
+          actionsEnabled={previewInList && !comparing}
+          busy={busy}
+          group={group}
+          groupLoading={groupLoading}
+          onClose={closePreview}
+          onPrev={() => stepPreview(-1)}
+          onNext={() => stepPreview(1)}
+          onAction={(t) => void previewAct(t)}
+          onPickMember={pickMember}
+        />
+      )}
+      {previewItem && previewItem.media_type !== 'video' && (
         <PreviewModal
           item={previewItem}
           position={anchorIndex >= 0 ? { index: anchorIndex + 1, total } : null}

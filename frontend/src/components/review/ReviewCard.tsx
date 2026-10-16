@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { Check, Maximize2, ShieldCheck } from 'lucide-react'
+import { Check, Maximize2, Play, ShieldCheck } from 'lucide-react'
 import { formatBytes } from '../../services/workflow'
 import { ReviewItem } from '../../services/reviewApi'
 import { ruleBadge, SCORE_AS_PERCENT_RULES } from './reviewMeta'
@@ -47,6 +47,7 @@ export const ReviewCard: React.FC<Props> = ({ item, index, selected, compact, th
   const shownRules = rules.slice(0, compact ? 1 : 2)
   const extraRules = rules.length - shownRules.length
   const showScore = SCORE_AS_PERCENT_RULES.has(item.rule)
+  const isVideo = item.media_type === 'video'
   const resolution = item.width && item.height ? `${item.width}×${item.height}` : null
   const taken = item.taken_at ? new Date(item.taken_at).toLocaleDateString('zh-TW') : null
   const allReasons = item.reasons.length > 0 ? item.reasons.join('\n') : item.reason
@@ -65,7 +66,7 @@ export const ReviewCard: React.FC<Props> = ({ item, index, selected, compact, th
       data-card="1"
       data-asset-id={item.asset_id}
       className={`group relative flex select-none flex-col gap-2 overflow-hidden rounded-2xl border p-[8px] cursor-pointer transition-colors ${frame}`}
-      title={`${item.primary_path}\n\n${allReasons}\n\n雙擊或按空白鍵預覽大圖`}
+      title={`${item.primary_path}\n\n${allReasons}\n\n${isVideo ? '雙擊或按空白鍵播放影片' : '雙擊或按空白鍵預覽大圖'}`}
     >
       {/* 縮圖 */}
       <div className="relative w-full shrink-0 overflow-hidden rounded-xl bg-slate-950" style={{ height: thumbH }}>
@@ -92,8 +93,8 @@ export const ReviewCard: React.FC<Props> = ({ item, index, selected, compact, th
           )}
           <button
             type="button"
-            aria-label="預覽大圖"
-            title="預覽大圖（雙擊卡片或按空白鍵）"
+            aria-label={isVideo ? '播放影片' : '預覽大圖'}
+            title={isVideo ? '播放影片（雙擊卡片或按空白鍵）' : '預覽大圖（雙擊卡片或按空白鍵）'}
             data-preview-btn="1"
             onClick={(e) => {
               e.stopPropagation()
@@ -102,7 +103,7 @@ export const ReviewCard: React.FC<Props> = ({ item, index, selected, compact, th
             onDoubleClick={(e) => e.stopPropagation()}
             className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-900/80 text-slate-200 opacity-0 transition-opacity hover:bg-sky-600 focus:opacity-100 group-hover:opacity-100 cursor-pointer"
           >
-            <Maximize2 className="h-3.5 w-3.5" />
+            {isVideo ? <Play className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
           </button>
         </div>
 

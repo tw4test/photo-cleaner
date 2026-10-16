@@ -115,6 +115,10 @@ def render(primary: str, companion: Optional[str], media_type: str) -> Preview:
         logger.warning("preview: 解碼失敗 %s — %s", src, exc)
         raise PreviewDecodeError(f"{type(exc).__name__}: {exc}") from exc
     if img is None:
+        if is_video:
+            from app.services import ffmpeg_service
+            hint = "" if ffmpeg_service.find_ffmpeg() else "（OpenCV 讀不到，且沒有安裝 ffmpeg 可作備援）"
+            raise PreviewDecodeError("讀不到影片的第一幀" + hint)
         raise PreviewDecodeError("讀不到影像內容")
     try:
         data = _encode_jpeg(img)

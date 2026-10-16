@@ -11,8 +11,8 @@ def _default_runners() -> int:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    APP_NAME: str = "相片瘦身 WebApp"
-    APP_VERSION: str = "0.5.0"
+    APP_NAME: str = "相片清理助手"
+    APP_VERSION: str = "0.7.0"
     HOST: str = "127.0.0.1"
     PORT: int = 8000
     DEBUG: bool = False
@@ -37,6 +37,19 @@ class Settings(BaseSettings):
 
     # CLIP 批次大小：0 = 依顯存自動決定
     CLIP_BATCH_SIZE: int = 0
+
+    # ── 影片（v0.7.0）──────────────────────────────────────────────────
+    # ffmpeg 是選用的：沒有時只是不能轉檔 / 抽幀，其他功能不受影響。
+    # 留空 = 從 PATH 找；也可在 .env 指定完整路徑（FFMPEG_PATH / FFPROBE_PATH）。
+    FFMPEG_PATH: str = ""
+    FFPROBE_PATH: str = ""
+    VIDEO_CACHE_MAX_BYTES: int = 5 * 1024 ** 3     # 轉檔快取上限（5 GB）
+    VIDEO_TRANSCODE_MAX_HEIGHT: int = 1080         # 轉檔輸出最高解析度（高）
+
+    @property
+    def VIDEO_CACHE_DIR(self) -> Path:
+        """轉檔結果：DATA_DIR/video_cache（只在第一次寫入時才建立）。"""
+        return self.DATA_DIR / "video_cache"
 
     @property
     def sqlite_db_path(self) -> Path:

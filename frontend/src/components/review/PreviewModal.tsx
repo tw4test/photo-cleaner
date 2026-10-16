@@ -15,7 +15,7 @@ import {
 } from 'lucide-react'
 import { formatBytes } from '../../services/workflow'
 import { GroupInfo, GroupMember, ReviewItem, ReviewState, previewUrl } from '../../services/reviewApi'
-import { ruleBadge, SCORE_AS_PERCENT_RULES } from './reviewMeta'
+import { isFixedScoreRule, ruleBadge, SCORE_AS_PERCENT_RULES } from './reviewMeta'
 
 /* ────────────────────────────────────────────────────────────
  * 大圖預覽（v0.6.5）
@@ -158,6 +158,13 @@ export const PreviewModal: React.FC<Props> = ({
         e.preventDefault()
         if (a.hasPrev) a.onPrev()
       } else if (k === 'ArrowRight') {
+        e.preventDefault()
+        if (a.hasNext) a.onNext()
+      } else if (k === 'PageUp') {
+        // v0.7.0：與影片播放器一致，PageUp / PageDown 也是上一個 / 下一個（清單裡可能混有影片）
+        e.preventDefault()
+        if (a.hasPrev) a.onPrev()
+      } else if (k === 'PageDown') {
         e.preventDefault()
         if (a.hasNext) a.onNext()
       } else if (k === 'f' || k === 'F') {
@@ -394,7 +401,7 @@ export const PreviewModal: React.FC<Props> = ({
                   ))}
                 </ul>
               )}
-              {item.reasons.length > 0 && <div className="mt-2 text-slate-500">分數 {shownScore}</div>}
+              {item.reasons.length > 0 && !isFixedScoreRule(item.rule) && <div className="mt-2 text-slate-500">分數 {shownScore}</div>}
             </section>
           )}
 

@@ -15,10 +15,11 @@ A local web app that helps you clean up a large photo library (about 100k photos
 - **Makes review quick.** Full-size preview, keyboard shortcuts, range select, "select everything that matches" with a preview and confirmation, and undo.
 - **Keeps you in control.** Scan, analyze and evaluate are separate steps you can run, retry or resume on their own.
 - **Treats pairs as one photo.** Live Photo (HEIC/JPG + MOV) and RAW + JPG are always handled together.
+- **Plays your videos.** An **All videos** page lists every video (searchable, sortable, read-only), and the review page plays video candidates in the same built-in player: seeking, speed, theater mode, picture-in-picture, fullscreen and keyboard shortcuts. Formats a browser cannot play (AVI, WMV, FLV, some MKV, HEVC) can be converted on demand with ffmpeg, which is optional.
 
 ## Safety
 
-- **Nothing is deleted until you confirm on the Process page.** Review, preview and settings only change the app's own database.
+- **Nothing is deleted until you confirm on the Process page.** Review, preview, video playback and settings only change the app's own database (video conversion only writes its own cache folder and never touches your originals).
 - **Deleted files go to the Recycle Bin.** Permanent deletion is not offered in the UI.
 - **Every duplicate group keeps at least one photo** (screenshots and documents are the one deliberate exception).
 - **Everything stays on your machine.** The backend listens on `127.0.0.1` only and sends no telemetry.
@@ -47,14 +48,16 @@ npm run dev
 
 Open <http://127.0.0.1:5173>, add a photo folder on the **資料庫掃描** page, and run the pipeline. API docs are at <http://127.0.0.1:8000/docs>.
 
-GPU acceleration, environment variables, performance tips and tests are covered in [`docs/operations.md`](docs/operations.md) (Traditional Chinese).
+**Optional: ffmpeg.** Videos that the browser can play natively (for example H.264 MP4) work without it. To play AVI, WMV, FLV, some MKV and HEVC files, install ffmpeg (`winget install Gyan.FFmpeg`, then restart the backend). Everything else works without it.
+
+GPU acceleration, ffmpeg, environment variables, performance tips and tests are covered in [`docs/operations.md`](docs/operations.md) (Traditional Chinese).
 
 ## Documentation
 
 | Document | What it is for |
 |---|---|
 | [`docs/functional-spec.md`](docs/functional-spec.md) | How the system is supposed to behave (requirements, rules, acceptance criteria, known gaps) |
-| [`docs/operations.md`](docs/operations.md) | Setup details, configuration, GPU, performance, NAS, testing |
+| [`docs/operations.md`](docs/operations.md) | Setup details, configuration, GPU, ffmpeg, performance, NAS, testing |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed in each version |
 | [`AGENT.md`](AGENT.md) | Working rules for AI coding assistants and new contributors |
 

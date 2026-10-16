@@ -69,5 +69,8 @@ export function ruleBadge(rule: string): RuleBadge {
   }
 }
 
+/** 影片規則的分數是固定值、不是 AI 信心度（VD-30）：不顯示分數，也不拿來排序 */
+export { FIXED_SCORE_RULES, isFixedScoreRule } from '../video/videoReviewLogic'
+
 /** 分數是 CLIP 機率（0–1）的規則：只有這些規則才顯示百分比 */
 export const SCORE_AS_PERCENT_RULES = new Set<string>(['screenshot', 'document', 'meme', 'mistouch'])

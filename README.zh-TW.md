@@ -13,10 +13,11 @@
 - **審核很快。** 大圖預覽、快速鍵、範圍選取、「選取符合條件的全部」（先預覽、再確認），以及復原。
 - **你掌握節奏。** 掃描、分析、評估是獨立的步驟，可以單獨執行、重試或續跑。
 - **配對檔視為同一張。** Live Photo（HEIC/JPG + MOV）與 RAW + JPG 一定一起處理。
+- **可以直接看影片。** 「所有影片」頁列出所有影片（可搜尋、排序，唯讀），審核頁的影片候選用同一個內建播放器播放：拖曳進度條、倍速、劇院模式、子母畫面、全螢幕與快速鍵。瀏覽器播不了的格式（AVI、WMV、FLV、部分 MKV、HEVC）可以用 ffmpeg 即時轉檔播放，ffmpeg 是選用的。
 
 ## 安全
 
-- **在「執行刪除」頁確認之前，不會刪除任何檔案。** 審核、預覽、設定只會改變程式自己的資料庫。
+- **在「執行刪除」頁確認之前，不會刪除任何檔案。** 審核、預覽、影片播放、設定只會改變程式自己的資料庫（影片轉檔只寫它自己的快取資料夾，不會動你的原檔）。
 - **刪除的檔案移到資源回收筒。** 介面不提供永久刪除。
 - **每個重複群組至少保留一張**（螢幕截圖與文件是唯一刻意的例外）。
 - **一切都留在你的電腦上。** 後端只監聽 `127.0.0.1`，沒有任何遙測。
@@ -45,14 +46,16 @@ npm run dev
 
 開啟 <http://127.0.0.1:5173>，在「資料庫掃描」頁加入相片資料夾並執行一鍵流水線。API 文件在 <http://127.0.0.1:8000/docs>。
 
-GPU 加速、環境變數、效能建議與測試請看 [`docs/operations.md`](docs/operations.md)。
+**選用：ffmpeg。** 瀏覽器能直接播的影片（例如 H.264 MP4）不需要它。要播放 AVI、WMV、FLV、部分 MKV 與 HEVC，請安裝 ffmpeg（`winget install Gyan.FFmpeg`，裝好後重新啟動後端）；沒有 ffmpeg 時其他功能都不受影響。
+
+GPU 加速、ffmpeg、環境變數、效能建議與測試請看 [`docs/operations.md`](docs/operations.md)。
 
 ## 文件
 
 | 文件 | 用途 |
 |---|---|
 | [`docs/functional-spec.md`](docs/functional-spec.md) | 系統應該怎麼運作（需求、規則、驗收條件、已知差距） |
-| [`docs/operations.md`](docs/operations.md) | 安裝細節、設定、GPU、效能、NAS、測試 |
+| [`docs/operations.md`](docs/operations.md) | 安裝細節、設定、GPU、ffmpeg、效能、NAS、測試 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 各版本的變更 |
 | [`AGENT.md`](AGENT.md) | 給 AI 程式助手與新貢獻者的工作規則 |
 

@@ -84,7 +84,14 @@ export interface AnalysisFailureItem {
 export interface ScanProgressState {
   is_scanning: boolean
   is_running?: boolean
-  job_type?: string // 'idle' | 'scan' | 'analyze' | 'rebuild_thumbs' | 'evaluate'
+  job_type?: string // 'idle' | 'scan' | 'analyze' | 'rebuild_thumbs' | 'evaluate' | 'pipeline'
+  /** 一鍵流水線目前步驟：scan | analyze | evaluate | done（v0.7.0） */
+  pipeline_step?: string
+  /** 評估結果 {skipped, added, removed, total}（評估與流水線完成後） */
+  evaluate_result?: Record<string, any>
+  /** false = 評估進行中，無法取消 */
+  cancellable?: boolean
+  finished_at?: number | null
   stage: string
   stage_label: string
   current_stage?: string

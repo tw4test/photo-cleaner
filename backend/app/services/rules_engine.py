@@ -31,6 +31,10 @@ DEFAULT_CONFIG: Dict[str, Any] = DEFAULT_SETTINGS
 
 _ACTIVE = Asset.status.notin_(list(INACTIVE_ASSET_STATUSES))
 
+# v0.7.0（VD-30）：影片候選的分數**不是 AI 信心度**，是規則固定值，不隨內容、門檻或設定改變。
+# 前端不可把它顯示成百分比，也不可當成「分數門檻」或「依分數排序」的依據。
+VIDEO_FIXED_SCORES = {"video_same_size": 1.0, "video_tiny": 0.7}
+
 _AI_RULES = [
     # (rule, setting enable key, threshold key, zs keys, reason template)
     (CandidateRule.SCREENSHOT, "rule_screenshot_enabled", "screenshot_threshold",
@@ -150,9 +154,10 @@ class RulesEngine:
             gtype = GroupType.VIDEO_SIZE.value if is_video else GroupType.EXACT.value
             members = [r.id for r in items]
             reasons = {r.id: "SHA-256 完全相同（與保留版本重複）" for r in items}
-            scores = {r.id: 1.0 for r in items}
+            score = VIDEO_FIXED_SCORES[rule] if is_video else 1.0
+            scores = {r.id: score for r in items}
             self._add_group(session, gtype, rule, members, keeper, reasons, scores,
-                            "SHA-256 完全相同（建議保留此版本）", counts, keeper_score=1.0)
+                            "SHA-256 完全相同（建議保留此版本）", counts, keeper_score=score)
             members_out.update(members)
         return members_out
 
@@ -401,7 +406,7 @@ class RulesEngine:
             session.add(Candidate(
                 asset_id=aid, rule=CandidateRule.VIDEO_TINY.value,
                 reason=f"影片極小（{size / 1024:.0f} KB < {limit // 1024} KB），可能是誤錄",
-                score=0.7, state=CandidateState.CANDIDATE.value))
+                score=VIDEO_FIXED_SCORES["video_tiny"], state=CandidateState.CANDIDATE.value))
             counts["video_tiny"] += 1
 
     # ─────────────────────────────────────────────

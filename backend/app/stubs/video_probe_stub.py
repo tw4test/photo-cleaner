@@ -25,15 +25,37 @@ class VideoProbe:
         return Path(file_path).suffix.lower() in self.VIDEO_EXTENSIONS
 
     def probe(self, file_path: str) -> Dict[str, Any]:
-        """讀取影片基礎資訊 (時長、解析度、編碼)。失敗時拋出 VideoProbeError。"""
+        """讀取影片基礎資訊 (時長、解析度、編碼)。失敗時拋出 VideoProbeError。
+
+        v0.7.0（VD-21）：OpenCV 打不開、或讀不到時長 / 解析度時，改用 ffprobe 補讀（HEVC、部分 MKV / WMV 常見）。
+        - OpenCV 讀到的欄位優先（與舊資料一致），只補它缺少的欄位；OpenCV 完全失敗時整組用 ffprobe 的值。
+        - ffprobe 是選用的：沒有安裝就維持舊行為（OpenCV 失敗 → VideoProbeError）。
+        """
         path = Path(file_path)
         if not path.exists():
             raise VideoProbeError(f"檔案不存在：{file_path}")
         size = path.stat().st_size
+        info, cv_error = self._probe_opencv(path)
+        if info is None or info["duration"] is None or info["width"] is None or info["height"] is None:
+            fb = self._probe_ffprobe(str(path))
+            if fb is not None:
+                if info is None:
+                    info = fb
+                else:
+                    for k in ("duration", "width", "height", "codec"):
+                        if info[k] is None:
+                            info[k] = fb[k]
+        if info is None:
+            raise VideoProbeError(cv_error or "讀不到任何影片資訊")
+        info["size"] = size
+        return info
+
+    def _probe_opencv(self, path: Path):
+        """回傳 (資訊 dict 或 None, 失敗原因)。"""
         cap = cv2.VideoCapture(str(path))
         try:
             if not cap.isOpened():
-                raise VideoProbeError("OpenCV 無法開啟影片（格式不支援或檔案損壞）")
+                return None, "OpenCV 無法開啟影片（格式不支援或檔案損壞）"
             frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
             fps = cap.get(cv2.CAP_PROP_FPS)
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
@@ -48,28 +70,50 @@ class VideoProbe:
         finally:
             cap.release()
         if duration is None and width is None and height is None and codec is None:
-            raise VideoProbeError("讀不到任何影片資訊（時長、解析度、編碼皆為空）")
+            return None, "讀不到任何影片資訊（時長、解析度、編碼皆為空）"
+        return {"duration": duration, "width": width, "height": height, "codec": codec}, None
+
+    def _probe_ffprobe(self, file_path: str) -> Optional[Dict[str, Any]]:
+        from app.services import ffmpeg_service
+        p = ffmpeg_service.probe(file_path)
+        if not p or not p.get("video"):
+            return None
+        v = p["video"]
+        dur = p.get("duration")
         return {
-            "duration": duration,
-            "width": width,
-            "height": height,
-            "codec": codec,
-            "size": size,
+            "duration": round(dur, 2) if dur else None,
+            "width": v.get("width") or None,
+            "height": v.get("height") or None,
+            "codec": v.get("codec"),
         }
 
     def extract_first_frame(self, file_path: str) -> Optional[Image.Image]:
-        """擷取影片第 1 幀作為縮圖。"""
+        """擷取影片第 1 幀。先用 OpenCV；打不開或讀不到幀（常見於 HEVC / 部分 MKV、WMV）時改用 ffmpeg（v0.7.0，VD-20）。
+        ffmpeg 是選用的：沒有安裝就回 None，維持舊行為。"""
+        img = self._first_frame_opencv(file_path)
+        if img is not None:
+            return img
+        from app.services import ffmpeg_service
+        img = ffmpeg_service.extract_frame(str(file_path))
+        if img is not None:
+            logger.debug("OpenCV 讀不到第一幀，已改用 ffmpeg：%s", file_path)
+        return img
+
+    def _first_frame_opencv(self, file_path: str) -> Optional[Image.Image]:
+        cap = None
         try:
             cap = cv2.VideoCapture(str(file_path))
             if not cap.isOpened():
                 return None
             success, frame = cap.read()
-            cap.release()
             if success and frame is not None:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 return Image.fromarray(rgb_frame)
         except Exception as e:
             logger.warning(f"Failed to extract first frame from {file_path}: {e}")
+        finally:
+            if cap is not None:
+                cap.release()
         return None
 
 
